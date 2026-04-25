@@ -446,6 +446,89 @@ private func pairTable(_ tableIndex: Int) -> PairHuffmanTable? {
     return pairTableArray[tableIndex]
 }
 
+// MARK: - Encoder fast-path cost lookup
+
+// Per-table primitive struct holding everything `huffmanPairBits` needs without
+// going through `[PairHuffmanTable?]` (which copies a `PairHuffmanTable` —
+// containing two CoW arrays — on every call) or even an Optional unwrap. The
+// cost data lives in process-lifetime UnsafeMutablePointer storage so callers
+// can read it via raw pointer without bumping any refcounts in the inner loop.
+
+struct HuffmanCostTable: @unchecked Sendable {
+    /// `xlen - 1`. Anything above this is unencodable for non-linbits tables.
+    var maxBaseValue: Int
+    /// Stride to step `firstBase` in the flat costs buffer; equals `xlen`.
+    var xlen: Int
+    /// Linbits per overflow side (0 if this table doesn't carry linbits).
+    var linbits: Int
+    /// Maximum value for `(absolute - 15)` before linbits saturates.
+    var linmax: Int
+    /// Pointer into a process-lifetime allocation of `xlen * xlen` UInt16 cost
+    /// entries (sign bits already folded in). `nil` for table 0 / undefined.
+    var costsBase: UnsafePointer<UInt16>?
+}
+
+let huffmanCostTables: [HuffmanCostTable] = {
+    var result: [HuffmanCostTable] = []
+    result.reserveCapacity(pairTableArray.count)
+    for tableIndex in 0 ..< pairTableArray.count {
+        guard let table = pairTableArray[tableIndex], tableIndex != 0 else {
+            result.append(HuffmanCostTable(
+                maxBaseValue: -1,
+                xlen: 0,
+                linbits: 0,
+                linmax: 0,
+                costsBase: nil
+            ))
+            continue
+        }
+        let entryCount = table.lengths.count
+        let storage = UnsafeMutablePointer<UInt16>.allocate(capacity: entryCount)
+        for entry in 0 ..< entryCount {
+            storage[entry] = UInt16(table.lengths[entry])
+        }
+        result.append(HuffmanCostTable(
+            maxBaseValue: table.xlen - 1,
+            xlen: table.xlen,
+            linbits: table.linbits,
+            linmax: table.linmax,
+            costsBase: UnsafePointer(storage)
+        ))
+    }
+    return result
+}()
+
+@inline(__always)
+private func huffmanPairBitsFast(absoluteFirst: Int, absoluteSecond: Int, info: HuffmanCostTable) -> Int {
+    guard let costsBase = info.costsBase else {
+        return 0
+    }
+    var baseFirst = absoluteFirst
+    var baseSecond = absoluteSecond
+    var totalBits = 0
+
+    if info.linbits > 0 {
+        if absoluteFirst >= 15 {
+            baseFirst = 15
+            if absoluteFirst - 15 > info.linmax {
+                return huffmanOverflowBits
+            }
+            totalBits += info.linbits
+        }
+        if absoluteSecond >= 15 {
+            baseSecond = 15
+            if absoluteSecond - 15 > info.linmax {
+                return huffmanOverflowBits
+            }
+            totalBits += info.linbits
+        }
+    } else if absoluteFirst > info.maxBaseValue || absoluteSecond > info.maxBaseValue {
+        return huffmanOverflowBits
+    }
+
+    return totalBits + Int(costsBase[baseFirst * info.xlen + baseSecond])
+}
+
 // MARK: - Decoder lookup tables
 
 /// Flat first-level prefix-lookup entry. `baseLen == 0` means the 10-bit prefix
@@ -909,23 +992,29 @@ func selectHuffmanTableAndBits(values: UnsafeBufferPointer<Int>, start: Int, end
 func countHuffmanBits2(
     values: UnsafeBufferPointer<Int>, start: Int, end: Int, firstTable: Int, secondTable: Int
 ) -> (Int, Int) {
+    let firstInfo = huffmanCostTables[firstTable]
+    let secondInfo = huffmanCostTables[secondTable]
     var totalFirst = 0
     var totalSecond = 0
     var pairIndex = start
     while pairIndex + 1 < end {
-        let firstValue = values[pairIndex]
-        let secondValue = values[pairIndex + 1]
-        let firstCost = huffmanPairBits(firstValue: firstValue, secondValue: secondValue, tableIndex: firstTable)
-        let secondCost = huffmanPairBits(firstValue: firstValue, secondValue: secondValue, tableIndex: secondTable)
-        if firstCost >= huffmanOverflowBits {
-            totalFirst = huffmanOverflowBits
-        } else if totalFirst != huffmanOverflowBits {
-            totalFirst += firstCost
+        let absoluteFirst = abs(values[pairIndex])
+        let absoluteSecond = abs(values[pairIndex + 1])
+        if totalFirst < huffmanOverflowBits {
+            let cost = huffmanPairBitsFast(absoluteFirst: absoluteFirst, absoluteSecond: absoluteSecond, info: firstInfo)
+            if cost >= huffmanOverflowBits {
+                totalFirst = huffmanOverflowBits
+            } else {
+                totalFirst += cost
+            }
         }
-        if secondCost >= huffmanOverflowBits {
-            totalSecond = huffmanOverflowBits
-        } else if totalSecond != huffmanOverflowBits {
-            totalSecond += secondCost
+        if totalSecond < huffmanOverflowBits {
+            let cost = huffmanPairBitsFast(absoluteFirst: absoluteFirst, absoluteSecond: absoluteSecond, info: secondInfo)
+            if cost >= huffmanOverflowBits {
+                totalSecond = huffmanOverflowBits
+            } else {
+                totalSecond += cost
+            }
         }
         pairIndex += 2
     }
@@ -937,30 +1026,39 @@ func countHuffmanBits2(
 func countHuffmanBits3(
     values: UnsafeBufferPointer<Int>, start: Int, end: Int, firstTable: Int, secondTable: Int, thirdTable: Int
 ) -> (Int, Int, Int) {
+    let firstInfo = huffmanCostTables[firstTable]
+    let secondInfo = huffmanCostTables[secondTable]
+    let thirdInfo = huffmanCostTables[thirdTable]
     var totalFirst = 0
     var totalSecond = 0
     var totalThird = 0
     var pairIndex = start
     while pairIndex + 1 < end {
-        let firstValue = values[pairIndex]
-        let secondValue = values[pairIndex + 1]
-        let firstCost = huffmanPairBits(firstValue: firstValue, secondValue: secondValue, tableIndex: firstTable)
-        let secondCost = huffmanPairBits(firstValue: firstValue, secondValue: secondValue, tableIndex: secondTable)
-        let thirdCost = huffmanPairBits(firstValue: firstValue, secondValue: secondValue, tableIndex: thirdTable)
-        if firstCost >= huffmanOverflowBits {
-            totalFirst = huffmanOverflowBits
-        } else if totalFirst != huffmanOverflowBits {
-            totalFirst += firstCost
+        let absoluteFirst = abs(values[pairIndex])
+        let absoluteSecond = abs(values[pairIndex + 1])
+        if totalFirst < huffmanOverflowBits {
+            let cost = huffmanPairBitsFast(absoluteFirst: absoluteFirst, absoluteSecond: absoluteSecond, info: firstInfo)
+            if cost >= huffmanOverflowBits {
+                totalFirst = huffmanOverflowBits
+            } else {
+                totalFirst += cost
+            }
         }
-        if secondCost >= huffmanOverflowBits {
-            totalSecond = huffmanOverflowBits
-        } else if totalSecond != huffmanOverflowBits {
-            totalSecond += secondCost
+        if totalSecond < huffmanOverflowBits {
+            let cost = huffmanPairBitsFast(absoluteFirst: absoluteFirst, absoluteSecond: absoluteSecond, info: secondInfo)
+            if cost >= huffmanOverflowBits {
+                totalSecond = huffmanOverflowBits
+            } else {
+                totalSecond += cost
+            }
         }
-        if thirdCost >= huffmanOverflowBits {
-            totalThird = huffmanOverflowBits
-        } else if totalThird != huffmanOverflowBits {
-            totalThird += thirdCost
+        if totalThird < huffmanOverflowBits {
+            let cost = huffmanPairBitsFast(absoluteFirst: absoluteFirst, absoluteSecond: absoluteSecond, info: thirdInfo)
+            if cost >= huffmanOverflowBits {
+                totalThird = huffmanOverflowBits
+            } else {
+                totalThird += cost
+            }
         }
         pairIndex += 2
     }
@@ -973,57 +1071,29 @@ func countHuffmanBits3(
 /// calling `huffmanEncodePair` and discarding the code.
 @inline(__always)
 func huffmanPairBits(firstValue: Int, secondValue: Int, tableIndex: Int) -> Int {
-    if tableIndex == 0 {
+    if tableIndex == 0 || tableIndex >= huffmanCostTables.count {
         return 0
     }
-    guard let table = pairTable(tableIndex) else {
-        return 0
-    }
-
-    let absoluteFirst = abs(firstValue)
-    let absoluteSecond = abs(secondValue)
-    var baseFirst = absoluteFirst
-    var baseSecond = absoluteSecond
-    var totalBits = 0
-
-    if table.linbits > 0 {
-        if absoluteFirst >= 15 {
-            baseFirst = 15
-            let linExtraFirst = absoluteFirst - 15
-            if linExtraFirst > table.linmax {
-                return huffmanOverflowBits
-            }
-            totalBits += table.linbits
-        }
-        if absoluteSecond >= 15 {
-            baseSecond = 15
-            let linExtraSecond = absoluteSecond - 15
-            if linExtraSecond > table.linmax {
-                return huffmanOverflowBits
-            }
-            totalBits += table.linbits
-        }
-    } else if absoluteFirst > table.maxBaseValue || absoluteSecond > table.maxBaseValue {
-        return huffmanOverflowBits
-    }
-
-    let tableOffset = baseFirst * table.xlen + baseSecond
-    if tableOffset >= table.lengths.count {
-        return huffmanOverflowBits
-    }
-    // lengths[] already includes sign-bit contributions.
-    return totalBits + table.lengths[tableOffset]
+    return huffmanPairBitsFast(
+        absoluteFirst: abs(firstValue),
+        absoluteSecond: abs(secondValue),
+        info: huffmanCostTables[tableIndex]
+    )
 }
 
 func countHuffmanBits(values: UnsafeBufferPointer<Int>, start: Int, end: Int, tableIndex: Int) -> Int {
-    if tableIndex == 0 {
+    if tableIndex == 0 || tableIndex >= huffmanCostTables.count {
         return 0
     }
-
+    let info = huffmanCostTables[tableIndex]
     var total = 0
     var pairIndex = start
     while pairIndex + 1 < end {
-        let bits = huffmanPairBits(firstValue: values[pairIndex], secondValue: values[pairIndex + 1], tableIndex: tableIndex)
+        let bits = huffmanPairBitsFast(
+            absoluteFirst: abs(values[pairIndex]),
+            absoluteSecond: abs(values[pairIndex + 1]),
+            info: info
+        )
         if bits >= huffmanOverflowBits {
             return huffmanOverflowBits
         }
@@ -1035,5 +1105,25 @@ func countHuffmanBits(values: UnsafeBufferPointer<Int>, start: Int, end: Int, ta
 
 @inline(__always)
 func countQuadBits(first: Int, second: Int, third: Int, fourth: Int, tableIndex: Int) -> Int {
-    huffmanEncodeQuad(first: first, second: second, third: third, fourth: fourth, tableIndex: tableIndex).bits
+    let index = (min(abs(first), 1) << 3)
+        | (min(abs(second), 1) << 2)
+        | (min(abs(third), 1) << 1)
+        | min(abs(fourth), 1)
+    return tableIndex == 0 ? quadTableA.lengths[index] : quadTableB.lengths[index]
+}
+
+/// Fused both-table quad cost. The count1 region picks the cheaper of two
+/// candidate quad tables, and the rate-control inner loop evaluates that
+/// choice across every probe — so doing one shared `quadIndex` computation
+/// and two table lookups beats two separate `huffmanEncodeQuad` calls that
+/// each redo the abs/min/index work and build a `code` we throw away.
+///
+/// Returns total bits (already includes sign bits) for `(tableA, tableB)`.
+@inline(__always)
+func countQuadBitsAB(first: Int, second: Int, third: Int, fourth: Int) -> (tableA: Int, tableB: Int) {
+    let index = (min(abs(first), 1) << 3)
+        | (min(abs(second), 1) << 2)
+        | (min(abs(third), 1) << 1)
+        | min(abs(fourth), 1)
+    return (quadTableA.lengths[index], quadTableB.lengths[index])
 }

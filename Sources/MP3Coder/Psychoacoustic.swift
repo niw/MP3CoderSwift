@@ -10,6 +10,10 @@ import Foundation
 /// Lightweight psychoacoustic model. Per-SFB masking thresholds are derived from
 /// (1) a frequency-dependent SNR target shaped by the absolute threshold of hearing,
 /// and (2) a one-tap spreading function so a loud band raises its neighbours' tolerance.
+///
+/// `Sendable` because every member is a value type and `computeThresholds` is a
+/// pure function (no internal mutation), so a single instance is safe to hand to
+/// multiple concurrent quantizer workers.
 struct PsychoacousticModel {
     var sampleRate: Int
     var scaleFactorBandBounds: [Int]

@@ -13,7 +13,11 @@ import Foundation
 /// The inner quantize step is vectorized via Accelerate using the identity
 /// `x^0.75 = sqrt(x * sqrt(x))`, which turns a per-element `pow()` into two
 /// `vvsqrtf` calls + one `vDSP_vmul` over 576 values.
-final class Quantizer {
+///
+/// `@unchecked Sendable` because all state is owned per-instance and the
+/// encoder's contract is to give each concurrent worker its own quantizer.
+/// Sharing a single instance across tasks would race on the scratch arrays.
+final class Quantizer: @unchecked Sendable {
     let scaleFactorBandBounds: [Int]
     /// Per bitstream slot, which short window (0..2) owns it. Used by `outerLoopShort`
     /// to compute per-window energy and pre-scale by 2^(2*sg_w).
@@ -30,16 +34,61 @@ final class Quantizer {
     private var quantizedInt32: ContiguousArray<Int32>
     private var quantizedScratch: ContiguousArray<Int>
     private var scaleFactorScratch: ContiguousArray<Float>
-    private var originalDoubleScratch: ContiguousArray<Double>
-    private var quantizedMagnitudeDoubleScratch: ContiguousArray<Double>
-    private var cbrtDoubleScratch: ContiguousArray<Double>
-    private var decodedDoubleScratch: ContiguousArray<Double>
-    private var diffDoubleScratch: ContiguousArray<Double>
+    /// Per-band distortion scratch (all `perBandDistortion` work done in Float).
+    /// The masking comparison has ~6 dB headroom so single precision is plenty.
+    private var quantizedMagnitudeFloatScratch: ContiguousArray<Float>
+    private var cbrtFloatScratch: ContiguousArray<Float>
+    private var decodedFloatScratch: ContiguousArray<Float>
+    private var diffFloatScratch: ContiguousArray<Float>
     private var distortionScratch: ContiguousArray<Float>
     /// Per-(window, band) energy scratch for short blocks (3 windows × 12 short bands).
     private var shortBandEnergyScratch: ContiguousArray<Double>
     /// Per-bitstream-slot scratch for the subblock-gain pre-scaled spectral.
     private var shortPreScaledScratch: ContiguousArray<Float>
+    /// Cache of `|spectral|^0.75` populated once per `innerLoop` call. Steps 1–4
+    /// of `quantizeInto` (vabs, vvsqrtf, vmul, vvsqrtf) only depend on the
+    /// spectral input, not on `globalGain`, so the binary search reuses this
+    /// across every probe instead of recomputing the four-stage Accelerate
+    /// pipeline.
+    private var absPow075Cache: ContiguousArray<Float>
+
+    /// Pre-allocated zero arrays handed to `GranuleInfo.scaleFactors` /
+    /// `scaleFactorsShort` instead of `Array(repeating: 0, …)` per granule.
+    /// Array assignment shares the buffer — CoW only triggers when the caller
+    /// mutates, which avoids one heap allocation per granule for the all-zero
+    /// path that distortion control hits before any band gets bumped.
+    private let zeroScaleFactorsLong: [Int]
+    private let zeroScaleFactorsShort: [Int] = Array(repeating: 0, count: 39)
+    /// Reused inside `distortionControlPass` for the local accumulator that
+    /// previously allocated `[Int](repeating: 0, count: bandCount)` per call.
+    private var distortionScaleFactorsScratch: [Int]
+
+    /// Per-quantizer counter storage. Always tracked (single array store per
+    /// bump), drained into a shared `MP3EncoderProfiler` between frames so
+    /// concurrent quantizer instances never write to the profiler in flight.
+    /// In production runs (no profiler attached) the increments are still
+    /// effectively free — the storage stays warm in cache and never escapes.
+    private var localCounters: [UInt64] = Array(
+        repeating: 0,
+        count: MP3EncoderProfiler.Counter.allCases.count
+    )
+
+    @inline(__always)
+    private func bumpCounter(_ counter: MP3EncoderProfiler.Counter, by amount: UInt64 = 1) {
+        localCounters[counter.rawValue] &+= amount
+    }
+
+    /// Returns the accumulated counter deltas since the last drain and resets
+    /// local storage to zero. Called by the encoder once per frame after the
+    /// per-channel parallel block completes — by that point every concurrent
+    /// quantizer is quiescent so the read is race-free.
+    func consumeLocalCounters() -> [UInt64] {
+        let snapshot = localCounters
+        for index in localCounters.indices {
+            localCounters[index] = 0
+        }
+        return snapshot
+    }
 
     init(sampleRate: Int) {
         scaleFactorBandBounds = MP3Constants.scaleFactorBandBoundaries(sampleRate: sampleRate)
@@ -51,61 +100,87 @@ final class Quantizer {
         quantizedInt32 = ContiguousArray(repeating: 0, count: 576)
         quantizedScratch = ContiguousArray(repeating: 0, count: 576)
         scaleFactorScratch = ContiguousArray(repeating: 0, count: 576)
-        originalDoubleScratch = ContiguousArray(repeating: 0, count: 576)
-        quantizedMagnitudeDoubleScratch = ContiguousArray(repeating: 0, count: 576)
-        cbrtDoubleScratch = ContiguousArray(repeating: 0, count: 576)
-        decodedDoubleScratch = ContiguousArray(repeating: 0, count: 576)
-        diffDoubleScratch = ContiguousArray(repeating: 0, count: 576)
+        quantizedMagnitudeFloatScratch = ContiguousArray(repeating: 0, count: 576)
+        cbrtFloatScratch = ContiguousArray(repeating: 0, count: 576)
+        decodedFloatScratch = ContiguousArray(repeating: 0, count: 576)
+        diffFloatScratch = ContiguousArray(repeating: 0, count: 576)
         distortionScratch = ContiguousArray(repeating: 0, count: max(1, scaleFactorBandBounds.count - 1))
         shortBandEnergyScratch = ContiguousArray(repeating: 0, count: 3 * 13)
         shortPreScaledScratch = ContiguousArray(repeating: 0, count: 576)
+        zeroScaleFactorsLong = Array(repeating: 0, count: max(1, scaleFactorBandBounds.count - 1))
+        distortionScaleFactorsScratch = Array(repeating: 0, count: max(1, scaleFactorBandBounds.count - 1))
+        absPow075Cache = ContiguousArray(repeating: 0, count: 576)
     }
 
     // MARK: - Vectorized quantize
 
     /// Quantize all 576 spectral values into `destination`.
     /// Formula: `quantized[i] = sign(x) * trunc(|x|^0.75 / 2^((g-210)/4) + 0.4054)`.
+    ///
+    /// One-shot path: prepares the gain-independent `|x|^0.75` cache, then
+    /// finishes with `quantizeFromCachedAbsPow075`. Callers that probe the same
+    /// spectral with multiple gains (the rate-control binary search) should
+    /// hit `prepareAbsPow075Cache` once and `quantizeFromCachedAbsPow075` per
+    /// probe to avoid redoing the four-stage Accelerate pipeline.
     func quantizeInto(spectral: UnsafePointer<Float>, globalGain: Int, destination: UnsafeMutablePointer<Int>) {
-        let length: vDSP_Length = 576
+        prepareAbsPow075Cache(spectral: spectral)
+        quantizeFromCachedAbsPow075(spectral: spectral, globalGain: globalGain, destination: destination)
+    }
 
-        // 1) absoluteBuffer = |spectral|
+    /// Compute `|spectral|^0.75` once into `absPow075Cache`. Independent of
+    /// `globalGain`, so a single call covers every binary-search probe.
+    @inline(__always)
+    private func prepareAbsPow075Cache(spectral: UnsafePointer<Float>) {
+        let length: vDSP_Length = 576
+        var lengthInt32: Int32 = 576
+
         absoluteBuffer.withUnsafeMutableBufferPointer { absoluteBuffer in
             vDSP_vabs(spectral, 1, absoluteBuffer.baseAddress!, 1, length)
 
-            // 2) sqrtBuffer = sqrt(|x|)
             sqrtBuffer.withUnsafeMutableBufferPointer { sqrtBuffer in
-                var lengthInt32: Int32 = 576
                 vvsqrtf(sqrtBuffer.baseAddress!, absoluteBuffer.baseAddress!, &lengthInt32)
 
-                // 3) scaledBuffer = |x| * sqrt(|x|) = |x|^1.5
                 scaledBuffer.withUnsafeMutableBufferPointer { scaledBuffer in
+                    // scaledBuffer = |x| * sqrt(|x|) = |x|^1.5
                     vDSP_vmul(absoluteBuffer.baseAddress!, 1, sqrtBuffer.baseAddress!, 1, scaledBuffer.baseAddress!, 1, length)
 
-                    // 4) sqrtBuffer = sqrt(|x|^1.5) = |x|^0.75 (reuse sqrtBuffer as raised)
-                    vvsqrtf(sqrtBuffer.baseAddress!, scaledBuffer.baseAddress!, &lengthInt32)
+                    absPow075Cache.withUnsafeMutableBufferPointer { cache in
+                        // cache = sqrt(|x|^1.5) = |x|^0.75
+                        vvsqrtf(cache.baseAddress!, scaledBuffer.baseAddress!, &lengthInt32)
+                    }
+                }
+            }
+        }
+    }
 
-                    // 5) scaledBuffer = sqrtBuffer * inverseScale + 0.4054
-                    var inverseScale = Float(pow(2.0, -Double(globalGain - 210) * 0.25))
-                    var bias: Float = 0.4054
-                    vDSP_vsmsa(sqrtBuffer.baseAddress!, 1, &inverseScale, &bias, scaledBuffer.baseAddress!, 1, length)
+    /// Apply `inverseScale + bias` and the truncate-with-sign step using the
+    /// cached `|x|^0.75`. Caller must have populated the cache via
+    /// `prepareAbsPow075Cache(spectral:)` (with the same spectral pointer used
+    /// for the sign source here) before invoking this.
+    @inline(__always)
+    private func quantizeFromCachedAbsPow075(
+        spectral: UnsafePointer<Float>,
+        globalGain: Int,
+        destination: UnsafeMutablePointer<Int>
+    ) {
+        let length: vDSP_Length = 576
+        let clampedGain = max(0, min(255, globalGain))
+        var inverseScale = Self.encoderGainScale[clampedGain]
+        var bias: Float = 0.4054
+        var lowerBound: Float = 0
+        var upperBound: Float = 1_073_741_824 // 2^30
 
-                    // 6) Clamp to a safe range so vDSP_vfix32 has defined behavior
-                    //    even when `inverseScale` is astronomical (low global gains).
-                    //    2^30 is well above any encodable Huffman magnitude.
-                    var lowerBound: Float = 0
-                    var upperBound: Float = 1_073_741_824 // 2^30
-                    vDSP_vclip(scaledBuffer.baseAddress!, 1, &lowerBound, &upperBound, scaledBuffer.baseAddress!, 1, length)
+        absPow075Cache.withUnsafeBufferPointer { cache in
+            scaledBuffer.withUnsafeMutableBufferPointer { scaledBuffer in
+                vDSP_vsmsa(cache.baseAddress!, 1, &inverseScale, &bias, scaledBuffer.baseAddress!, 1, length)
+                vDSP_vclip(scaledBuffer.baseAddress!, 1, &lowerBound, &upperBound, scaledBuffer.baseAddress!, 1, length)
 
-                    // 7) Truncate to Int32
-                    quantizedInt32.withUnsafeMutableBufferPointer { quantizedInt32 in
-                        vDSP_vfix32(scaledBuffer.baseAddress!, 1, quantizedInt32.baseAddress!, 1, length)
-
-                        // 8) Apply sign based on the original spectral value
-                        let quantizedBase = quantizedInt32.baseAddress!
-                        for index in 0 ..< 576 {
-                            let magnitude = Int(quantizedBase[index])
-                            destination[index] = spectral[index] < 0 ? -magnitude : magnitude
-                        }
+                quantizedInt32.withUnsafeMutableBufferPointer { quantizedInt32 in
+                    vDSP_vfix32(scaledBuffer.baseAddress!, 1, quantizedInt32.baseAddress!, 1, length)
+                    let quantizedBase = quantizedInt32.baseAddress!
+                    for index in 0 ..< 576 {
+                        let magnitude = Int(quantizedBase[index])
+                        destination[index] = spectral[index] < 0 ? -magnitude : magnitude
                     }
                 }
             }
@@ -119,7 +194,11 @@ final class Quantizer {
     func countBits(quantized: UnsafeBufferPointer<Int>, granuleInfo: inout GranuleInfo) -> Int {
         let count = quantized.count
 
-        // Last non-zero coefficient
+        // Last non-zero coefficient. Reverse scan bails on the first non-zero
+        // from the high-frequency end, which is typically a few iterations on
+        // real music (high bins quantize to 0 first as gain rises). Tracking
+        // this in the quantize step over all 576 elements turned out to be
+        // slower than this early-exit scan.
         var lastNonZeroIndex = -1
         for index in stride(from: count - 1, through: 0, by: -1) {
             if quantized[index] != 0 {
@@ -130,7 +209,9 @@ final class Quantizer {
 
         if lastNonZeroIndex < 0 {
             granuleInfo.bigValues = 0
-            granuleInfo.tableSelect = [0, 0, 0]
+            granuleInfo.tableSelect[0] = 0
+            granuleInfo.tableSelect[1] = 0
+            granuleInfo.tableSelect[2] = 0
             granuleInfo.region0Count = 10
             granuleInfo.region1Count = 3
             granuleInfo.count1TableSelect = 0
@@ -170,7 +251,10 @@ final class Quantizer {
 
         var bits = region0Selection.bits + region1Selection.bits + region2Selection.bits
 
-        // count1 quads: try both count1 tables, pick the smaller
+        // count1 quads: try both count1 tables, pick the smaller. The fused
+        // helper computes the shared 4-bit index once and indexes both length
+        // tables in lockstep — the per-quad work was previously two full
+        // `huffmanEncodeQuad` calls (with code-building we throw away).
         var quadIndex = bigValuesEnd
         var count1BitsTableA = 0
         var count1BitsTableB = 0
@@ -182,8 +266,9 @@ final class Quantizer {
             if abs(first) > 1 || abs(second) > 1 || abs(third) > 1 || abs(fourth) > 1 {
                 break
             }
-            count1BitsTableA += countQuadBits(first: first, second: second, third: third, fourth: fourth, tableIndex: 0)
-            count1BitsTableB += countQuadBits(first: first, second: second, third: third, fourth: fourth, tableIndex: 1)
+            let costs = countQuadBitsAB(first: first, second: second, third: third, fourth: fourth)
+            count1BitsTableA += costs.tableA
+            count1BitsTableB += costs.tableB
             quadIndex += 4
         }
 
@@ -224,67 +309,161 @@ final class Quantizer {
         destination: UnsafeMutableBufferPointer<Int>,
         granuleInfo: inout GranuleInfo
     ) -> Int {
+        bumpCounter(.innerLoopCalls)
+
         let hint = granuleInfo.globalGain
-        var lowerGain = 0
-        var upperGain = 255
+        // bits(gain) is monotone non-increasing in gain (higher gain → coarser
+        // quantization → fewer Huffman bits). The minimum-gain-that-fits is
+        // therefore the boundary in a sorted array, which we locate with a
+        // hint-anchored step-doubling bracket instead of a fresh [0, 255]
+        // binary search. Typical convergence drops from ~9 probes to 3-5.
+        // Initialised to the legacy fallback (255, 0): if no gain in [0, 255]
+        // fits the budget the search exits without updating these and the
+        // final write at gain = 255 is what the original behaviour produced.
         var bestGain = 255
         var bestBits = 0
         var bestGranuleInfo = granuleInfo
+        var bestFound = false
+
+        // Compute |x|^0.75 once for this spectral input — every probe and the
+        // smoothing fallback reuses it via `quantizeFromCachedAbsPow075`,
+        // removing ~80% of the Accelerate work per probe.
+        prepareAbsPow075Cache(spectral: spectral.baseAddress!)
 
         quantizedScratch.withUnsafeMutableBufferPointer { quantizedBuffer in
-            // Warm-start: try the hint first, then narrow the search around it.
-            // For consecutive long blocks on the same channel this typically converges
-            // in 2–3 iterations instead of the full ~8.
-            if hint > 0, hint < 256 {
-                var hintCandidateInfo = granuleInfo
-                quantizeInto(spectral: spectral.baseAddress!, globalGain: hint, destination: quantizedBuffer.baseAddress!)
-                let hintBits = countBits(quantized: UnsafeBufferPointer(quantizedBuffer), granuleInfo: &hintCandidateInfo)
-                if hintBits <= targetBits {
-                    bestGain = hint
-                    bestBits = hintBits
-                    bestGranuleInfo = hintCandidateInfo
-                    upperGain = hint - 1
-                } else {
-                    lowerGain = hint + 1
+            let spectralBase = spectral.baseAddress!
+            let scratchBase = quantizedBuffer.baseAddress!
+
+            // Local probe helper. Returns (bits, info) at `gain`. The
+            // destination is the shared scratch buffer; the caller is
+            // responsible for re-running the chosen gain into the real
+            // destination at the end.
+            @inline(__always)
+            func probe(_ gain: Int) -> (bits: Int, info: GranuleInfo) {
+                bumpCounter(.innerLoopProbes)
+                var info = granuleInfo
+                quantizeFromCachedAbsPow075(spectral: spectralBase, globalGain: gain, destination: scratchBase)
+                let bits = countBits(quantized: UnsafeBufferPointer(quantizedBuffer), granuleInfo: &info)
+                return (bits, info)
+            }
+
+            // Anchor: warm-start at the hint when one is provided, else at the
+            // GranuleInfo default (210). The starting point only affects probe
+            // count, never the chosen gain — bits(gain) is monotone so any
+            // starting probe leads to the same boundary.
+            let startGain = hint > 0 && hint < 256 ? hint : 210
+            let (startBits, startInfo) = probe(startGain)
+
+            if startBits <= targetBits {
+                bestGain = startGain
+                bestBits = startBits
+                bestGranuleInfo = startInfo
+                bestFound = true
+                if hint > 0, hint < 256, startGain == hint {
+                    bumpCounter(.innerLoopHintHits)
+                }
+
+                // Walk down with step doublings to bracket the optimum from
+                // above. The largest gain that does NOT fit defines the lower
+                // exclusive bound; the smallest gain that DOES fit (so far)
+                // defines the upper inclusive bound.
+                var lastLowMiss = -1
+                var lastHighFit = startGain
+                var step = 1
+                var probeGain = startGain - step
+                while probeGain >= 0 {
+                    let (bits, info) = probe(probeGain)
+                    if bits <= targetBits {
+                        bestGain = probeGain
+                        bestBits = bits
+                        bestGranuleInfo = info
+                        lastHighFit = probeGain
+                        step <<= 1
+                        probeGain = lastHighFit - step
+                    } else {
+                        lastLowMiss = probeGain
+                        break
+                    }
+                }
+
+                // Binary search the (lastLowMiss, lastHighFit) bracket for the
+                // smallest gain that still fits. Skip if walk-down already hit
+                // 0 without missing — then bestGain == 0 is already optimal.
+                var lo = lastLowMiss + 1
+                var hi = lastHighFit - 1
+                while lo <= hi {
+                    let midGain = (lo + hi) / 2
+                    let (bits, info) = probe(midGain)
+                    if bits <= targetBits {
+                        bestGain = midGain
+                        bestBits = bits
+                        bestGranuleInfo = info
+                        hi = midGain - 1
+                    } else {
+                        lo = midGain + 1
+                    }
+                }
+            } else {
+                // Optimum is above startGain. Walk up by step doublings until
+                // a gain fits or we leave the [0, 255] range.
+                var lastLowMiss = startGain
+                var lastHighFit = -1
+                var step = 1
+                var probeGain = startGain + step
+                while probeGain <= 255 {
+                    let (bits, info) = probe(probeGain)
+                    if bits <= targetBits {
+                        lastHighFit = probeGain
+                        bestGain = probeGain
+                        bestBits = bits
+                        bestGranuleInfo = info
+                        bestFound = true
+                        break
+                    } else {
+                        lastLowMiss = probeGain
+                        step <<= 1
+                        probeGain = lastLowMiss + step
+                    }
+                }
+
+                if bestFound {
+                    var lo = lastLowMiss + 1
+                    var hi = lastHighFit - 1
+                    while lo <= hi {
+                        let midGain = (lo + hi) / 2
+                        let (bits, info) = probe(midGain)
+                        if bits <= targetBits {
+                            bestGain = midGain
+                            bestBits = bits
+                            bestGranuleInfo = info
+                            hi = midGain - 1
+                        } else {
+                            lo = midGain + 1
+                        }
+                    }
                 }
             }
 
-            while lowerGain <= upperGain {
-                let midGain = (lowerGain + upperGain) / 2
-                var candidateInfo = granuleInfo
-                quantizeInto(spectral: spectral.baseAddress!, globalGain: midGain, destination: quantizedBuffer.baseAddress!)
-                let bits = countBits(quantized: UnsafeBufferPointer(quantizedBuffer), granuleInfo: &candidateInfo)
-
-                if bits <= targetBits {
-                    bestGain = midGain
-                    bestBits = bits
-                    bestGranuleInfo = candidateInfo
-                    upperGain = midGain - 1
-                } else {
-                    lowerGain = midGain + 1
-                }
-            }
-
-            // Smoothing clamp: when the optimum dropped well below the hint, raise it
-            // back toward the hint by at most `gainSmoothingMaxDelta`. We re-quantize at
-            // the smoothed gain and re-count bits so part2_3_length stays accurate. The
-            // smoothed gain is always ≥ bestGain (= fewer bits used), so the bit budget
-            // stays satisfied for free.
-            if hint > 0, bestGain < hint - Self.gainSmoothingMaxDelta {
+            // Smoothing clamp: when the optimum dropped well below the hint,
+            // raise it back toward the hint by at most `gainSmoothingMaxDelta`.
+            // The smoothed gain is always ≥ bestGain (fewer bits used), so the
+            // bit budget stays satisfied for free; we still re-count bits so
+            // `part2_3_length` reflects the emitted Huffman bytes.
+            if bestFound, hint > 0, bestGain < hint - Self.gainSmoothingMaxDelta {
                 let smoothedGain = min(255, hint - Self.gainSmoothingMaxDelta)
-                var candidateInfo = granuleInfo
-                quantizeInto(spectral: spectral.baseAddress!, globalGain: smoothedGain, destination: quantizedBuffer.baseAddress!)
-                let smoothedBits = countBits(quantized: UnsafeBufferPointer(quantizedBuffer), granuleInfo: &candidateInfo)
+                let (smoothedBits, smoothedInfo) = probe(smoothedGain)
                 if smoothedBits <= targetBits {
                     bestGain = smoothedGain
                     bestBits = smoothedBits
-                    bestGranuleInfo = candidateInfo
+                    bestGranuleInfo = smoothedInfo
+                    bumpCounter(.innerLoopSmoothingFires)
                 }
             }
         }
 
         // Produce bestGain's quantized values directly into the caller's buffer.
-        quantizeInto(spectral: spectral.baseAddress!, globalGain: bestGain, destination: destination.baseAddress!)
+        quantizeFromCachedAbsPow075(spectral: spectral.baseAddress!, globalGain: bestGain, destination: destination.baseAddress!)
+        bumpCounter(.innerLoopProbes)
 
         granuleInfo = bestGranuleInfo
         granuleInfo.globalGain = bestGain
@@ -309,6 +488,7 @@ final class Quantizer {
         // goes to Huffman data. This is correct but suboptimal — per-(window, band)
         // scale factor optimization can be layered in later without changing callers.
         if granuleInfo.blockType == MDCTBlockType.shortBlocks.rawValue {
+            bumpCounter(.outerLoopShortPasses)
             return outerLoopShort(
                 spectral: spectral,
                 targetBits: targetBits + reservoirBits,
@@ -344,6 +524,8 @@ final class Quantizer {
             return baseBits
         }
 
+        bumpCounter(.outerLoopReservoirPasses)
+
         // If the base pass converged without bumping any scale factors, the reservoir
         // pass with a larger budget would only produce smaller quantized values and even
         // less distortion — running the full three-iteration distortion-control loop again
@@ -352,7 +534,7 @@ final class Quantizer {
         // through the binary search) roughly in half for well-masked audio.
         if workingInfo.scaleFactors.allSatisfy({ $0 == 0 }) {
             var reservoirInfo = originalInfo
-            reservoirInfo.scaleFactors = [Int](repeating: 0, count: scaleFactorBandBounds.count - 1)
+            reservoirInfo.scaleFactors = zeroScaleFactorsLong
             reservoirInfo.scaleFactorScale = false
             reservoirInfo.scaleFactorCompress = 0
             reservoirInfo.part2Length = 0
@@ -433,14 +615,19 @@ final class Quantizer {
         return shortPreScaledScratch.withUnsafeMutableBufferPointer { preScaled in
             shortWindowTable.withUnsafeBufferPointer { windowIndices in
                 let windowBase = windowIndices.baseAddress!
-                let factors = (0 ..< 3).map { Float(pow(2.0, Double(2 * subblockGain[$0]))) }
+                let factor0 = Self.subblockPreScale[max(0, min(7, subblockGain[0]))]
+                let factor1 = Self.subblockPreScale[max(0, min(7, subblockGain[1]))]
+                let factor2 = Self.subblockPreScale[max(0, min(7, subblockGain[2]))]
+                let factors = (factor0, factor1, factor2)
                 for index in 0 ..< 576 {
-                    preScaled[index] = spectral[index] * factors[windowBase[index]]
+                    let window = windowBase[index]
+                    let factor = window == 0 ? factors.0 : (window == 1 ? factors.1 : factors.2)
+                    preScaled[index] = spectral[index] * factor
                 }
             }
 
-            granuleInfo.scaleFactors = Array(repeating: 0, count: scaleFactorBandBounds.count - 1)
-            granuleInfo.scaleFactorsShort = Array(repeating: 0, count: 39)
+            granuleInfo.scaleFactors = zeroScaleFactorsLong
+            granuleInfo.scaleFactorsShort = zeroScaleFactorsShort
             granuleInfo.scaleFactorScale = false
             granuleInfo.scaleFactorCompress = 0
             granuleInfo.part2Length = 0
@@ -515,11 +702,20 @@ final class Quantizer {
         // so bands sitting on the boundary don't toggle frame-to-frame.
         let bumpMargin: Float = 2.0
 
-        var scaleFactors = [Int](repeating: 0, count: bandCount)
+        // Reset the persistent scratch instead of allocating a fresh `[Int]`.
+        // CoW still kicks in when the array gets shared into `workingInfo.scaleFactors`
+        // and then bumped, but the initial 22-Int heap allocation is gone.
+        for index in 0 ..< distortionScaleFactorsScratch.count {
+            distortionScaleFactorsScratch[index] = 0
+        }
+        var scaleFactors = distortionScaleFactorsScratch
         var resultInfo = granuleInfo
         var resultBits = 0
 
+        bumpCounter(.distortionPasses)
+
         for iteration in 0 ..< maxIterations {
+            bumpCounter(.distortionIterations)
             var workingInfo = granuleInfo
             workingInfo.scaleFactors = scaleFactors
             workingInfo.scaleFactorScale = scaleFactorScale
@@ -671,21 +867,19 @@ final class Quantizer {
         }
 
         var sampleCountInt32 = Int32(sampleCount)
-        originalDoubleScratch.withUnsafeMutableBufferPointer { originalDouble in
-            vDSP_vspdp(originalSpectral.baseAddress!, 1, originalDouble.baseAddress!, 1, vDSP_Length(sampleCount))
-        }
 
-        quantizedMagnitudeDoubleScratch.withUnsafeMutableBufferPointer { magnitudes in
-            decodedDoubleScratch.withUnsafeMutableBufferPointer { decoded in
+        quantizedMagnitudeFloatScratch.withUnsafeMutableBufferPointer { magnitudes in
+            decodedFloatScratch.withUnsafeMutableBufferPointer { decoded in
                 let magnitudeBase = magnitudes.baseAddress!
                 let decodedBase = decoded.baseAddress!
                 for index in 0 ..< sampleCount {
-                    magnitudeBase[index] = Double(abs(quantized[index]))
+                    magnitudeBase[index] = Float(abs(quantized[index]))
                 }
 
-                cbrtDoubleScratch.withUnsafeMutableBufferPointer { roots in
-                    vvcbrt(roots.baseAddress!, magnitudeBase, &sampleCountInt32)
-                    vDSP_vmulD(roots.baseAddress!, 1, magnitudeBase, 1, decodedBase, 1, vDSP_Length(sampleCount))
+                cbrtFloatScratch.withUnsafeMutableBufferPointer { roots in
+                    vvcbrtf(roots.baseAddress!, magnitudeBase, &sampleCountInt32)
+                    // decoded = magnitude * cbrt(magnitude) = magnitude^(4/3)
+                    vDSP_vmul(roots.baseAddress!, 1, magnitudeBase, 1, decodedBase, 1, vDSP_Length(sampleCount))
                     for index in 0 ..< sampleCount where quantized[index] < 0 {
                         decodedBase[index] = -decodedBase[index]
                     }
@@ -693,8 +887,9 @@ final class Quantizer {
             }
         }
 
-        let gainScale = pow(2.0, Double(globalGain - 210) * 0.25)
-        let multiplier = scaleFactorScale ? 1.0 : 0.5
+        let clampedGain = max(0, min(255, globalGain))
+        let gainScale = Float(Self.decoderGainScale[clampedGain])
+        let multiplierTable = Self.scaleFactorDecodeMultiplier[scaleFactorScale ? 1 : 0]
 
         for band in 0 ..< bandCount {
             let bandStart = scaleFactorBandBounds[band]
@@ -703,22 +898,20 @@ final class Quantizer {
                 continue
             }
 
-            let scaleFactor = band < scaleFactors.count ? scaleFactors[band] : 0
-            var bandFactor = gainScale * pow(2.0, -Double(scaleFactor) * multiplier)
+            let scaleFactor = band < scaleFactors.count ? max(0, min(15, scaleFactors[band])) : 0
+            var bandFactor = gainScale * Float(multiplierTable[scaleFactor])
             let bandLength = vDSP_Length(bandEnd - bandStart)
 
-            decodedDoubleScratch.withUnsafeMutableBufferPointer { decoded in
-                originalDoubleScratch.withUnsafeBufferPointer { original in
-                    diffDoubleScratch.withUnsafeMutableBufferPointer { diff in
-                        let decodedBand = decoded.baseAddress! + bandStart
-                        let originalBand = original.baseAddress! + bandStart
-                        let diffBand = diff.baseAddress! + bandStart
-                        vDSP_vsmulD(decodedBand, 1, &bandFactor, decodedBand, 1, bandLength)
-                        vDSP_vsubD(decodedBand, 1, originalBand, 1, diffBand, 1, bandLength)
-                        var bandDistortion = 0.0
-                        vDSP_svesqD(diffBand, 1, &bandDistortion, bandLength)
-                        distortion[band] = Float(bandDistortion)
-                    }
+            decodedFloatScratch.withUnsafeMutableBufferPointer { decoded in
+                diffFloatScratch.withUnsafeMutableBufferPointer { diff in
+                    let decodedBand = decoded.baseAddress! + bandStart
+                    let originalBand = originalSpectral.baseAddress! + bandStart
+                    let diffBand = diff.baseAddress! + bandStart
+                    vDSP_vsmul(decodedBand, 1, &bandFactor, decodedBand, 1, bandLength)
+                    vDSP_vsub(decodedBand, 1, originalBand, 1, diffBand, 1, bandLength)
+                    var bandDistortion: Float = 0
+                    vDSP_svesq(diffBand, 1, &bandDistortion, bandLength)
+                    distortion[band] = bandDistortion
                 }
             }
         }
@@ -730,7 +923,7 @@ final class Quantizer {
         scaleFactorScale: Bool,
         destination: UnsafeMutableBufferPointer<Float>
     ) {
-        let multiplier = scaleFactorScale ? 1.0 : 0.5
+        let multiplierTable = Self.scaleFactorEncodeMultiplier[scaleFactorScale ? 1 : 0]
         let count = min(spectral.count, destination.count)
         destination.baseAddress!.update(from: spectral.baseAddress!, count: count)
 
@@ -741,7 +934,8 @@ final class Quantizer {
                 continue
             }
 
-            var factor = Float(pow(2.0, multiplier * Double(scaleFactors[band])))
+            let scaleFactor = max(0, min(15, scaleFactors[band]))
+            var factor = multiplierTable[scaleFactor]
             if factor == 1 {
                 continue
             }
@@ -779,10 +973,52 @@ final class Quantizer {
         return 11 * lowBitLength + 10 * highBitLength
     }
 
+    // ISO 11172-3 Table B.6 (`scalefac_compress`): each index maps to a
+    // (slen1, slen2) bit-length pair for low (sfb 0–10) and high (sfb 11–20)
+    // long-block scale factors.
+    private static let scaleFactorBitLengthsLow: [Int] = [0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4]
+    private static let scaleFactorBitLengthsHigh: [Int] = [0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3]
+
     private func scaleFactorBitLengthPair(for compress: Int) -> (Int, Int) {
-        let lowBitLengths = [0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4]
-        let highBitLengths = [0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3]
         let index = max(0, min(compress, 15))
-        return (lowBitLengths[index], highBitLengths[index])
+        return (Self.scaleFactorBitLengthsLow[index], Self.scaleFactorBitLengthsHigh[index])
+    }
+
+    // MARK: - Precomputed pow(2, …) tables
+
+    // Replaces per-call `pow(2.0, …)` invocations on small integer-domain
+    // exponents. The Float-domain entries are computed via `Float(pow(2.0, …))`
+    // so the encoder stays bit-equivalent with the previous inline path.
+
+    /// Encoder-side per-`global_gain` scale: `2^(-(g-210)/4)` for g ∈ [0, 255].
+    /// Used by `quantizeInto` once per binary-search probe (~10-20× per granule).
+    private static let encoderGainScale: [Float] = (0 ..< 256).map { gain in
+        Float(pow(2.0, -Double(gain - 210) * 0.25))
+    }
+
+    /// Decoder-direction per-`global_gain` scale: `2^((g-210)/4)`. Double-precision
+    /// mirror of `encoderGainScale`, used by `perBandDistortion`.
+    private static let decoderGainScale: [Double] = (0 ..< 256).map { gain in
+        pow(2.0, Double(gain - 210) * 0.25)
+    }
+
+    /// Encoder-direction `2^(multiplier * sf)` with `multiplier ∈ {0.5, 1.0}`
+    /// and `sf ∈ [0, 15]`. First index is `scaleFactorScale ? 1 : 0`.
+    private static let scaleFactorEncodeMultiplier: [[Float]] = [
+        (0 ..< 16).map { sf in Float(pow(2.0, 0.5 * Double(sf))) },
+        (0 ..< 16).map { sf in Float(pow(2.0, 1.0 * Double(sf))) },
+    ]
+
+    /// Decoder-direction `2^(-multiplier * sf)` with the same axes as
+    /// `scaleFactorEncodeMultiplier`. Double-precision so it can be folded
+    /// into the perBandDistortion gain factor without a precision loss.
+    private static let scaleFactorDecodeMultiplier: [[Double]] = [
+        (0 ..< 16).map { sf in pow(2.0, -0.5 * Double(sf)) },
+        (0 ..< 16).map { sf in pow(2.0, -1.0 * Double(sf)) },
+    ]
+
+    /// Short-block `subblock_gain` pre-scale: `2^(2 * sg)` for sg ∈ [0, 7].
+    private static let subblockPreScale: [Float] = (0 ..< 8).map { sg in
+        Float(pow(2.0, Double(2 * sg)))
     }
 }

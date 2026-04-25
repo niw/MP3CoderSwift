@@ -118,11 +118,17 @@ final class MDCTProcessor {
     private var windowedScratch: ContiguousArray<Double>
     /// Flat Double accumulator for 576 spectral outputs (converted to Float on copy-out).
     private var spectralScratch: ContiguousArray<Double>
+    /// Reusable 36-sample input buffer for the short-block path (overlap || current).
+    private var shortInputScratch: ContiguousArray<Double>
+    /// Reusable 12-sample windowed slice for each short MDCT window.
+    private var shortWindowedScratch: ContiguousArray<Double>
 
     init() {
         overlapBuffer = ContiguousArray(repeating: 0, count: 32 * 18)
         windowedScratch = ContiguousArray(repeating: 0, count: 36)
         spectralScratch = ContiguousArray(repeating: 0, count: 576)
+        shortInputScratch = ContiguousArray(repeating: 0, count: 36)
+        shortWindowedScratch = ContiguousArray(repeating: 0, count: 12)
     }
 
     /// Process one granule.
@@ -255,66 +261,68 @@ final class MDCTProcessor {
     ) {
         overlapBuffer.withUnsafeMutableBufferPointer { overlap in
             spectralScratch.withUnsafeMutableBufferPointer { spectral in
-                shortWindow.withUnsafeBufferPointer { shortWindowBuffer in
-                    mdctShortCosineFlat.withUnsafeBufferPointer { cosineBuffer in
-                        let shortWindowBase = shortWindowBuffer.baseAddress!
-                        let cosineBase = cosineBuffer.baseAddress!
+                shortInputScratch.withUnsafeMutableBufferPointer { subbandWindowed in
+                    shortWindowedScratch.withUnsafeMutableBufferPointer { windowedShort in
+                        shortWindow.withUnsafeBufferPointer { shortWindowBuffer in
+                            mdctShortCosineFlat.withUnsafeBufferPointer { cosineBuffer in
+                                let shortWindowBase = shortWindowBuffer.baseAddress!
+                                let cosineBase = cosineBuffer.baseAddress!
 
-                        var subbandWindowed = [Double](repeating: 0, count: 36)
-                        for subband in 0 ..< 32 {
-                            let overlapBase = overlap.baseAddress!.advanced(by: subband * 18)
-                            let inputBase = subbandSamples.advanced(by: subband * 18)
-                            let flipOdd = (subband & 1) == 1
+                                for subband in 0 ..< 32 {
+                                    let overlapBase = overlap.baseAddress!.advanced(by: subband * 18)
+                                    let inputBase = subbandSamples.advanced(by: subband * 18)
+                                    let flipOdd = (subband & 1) == 1
 
-                            // Build the 36-sample input from previous overlap (first 18) and current
-                            // samples (next 18), applying the odd-subband sign flip on the current
-                            // half just like the long path. Update the overlap buffer for the next granule.
-                            for index in 0 ..< 18 {
-                                subbandWindowed[index] = overlapBase[index]
-                            }
-                            if flipOdd {
-                                for index in 0 ..< 18 {
-                                    let sampleValue = (index & 1) == 1 ? -inputBase[index] : inputBase[index]
-                                    overlapBase[index] = sampleValue
-                                    subbandWindowed[18 + index] = sampleValue
-                                }
-                            } else {
-                                for index in 0 ..< 18 {
-                                    let sampleValue = inputBase[index]
-                                    overlapBase[index] = sampleValue
-                                    subbandWindowed[18 + index] = sampleValue
-                                }
-                            }
-
-                            // Three short MDCTs: each takes a 12-sample windowed slice starting at
-                            // offsets 6, 12, 18 of the 36-sample input.
-                            let subbandOutput = spectral.baseAddress!.advanced(by: subband * 18)
-                            for windowIndex in 0 ..< 3 {
-                                let inputOffset = 6 + windowIndex * 6
-                                var windowedShort = [Double](repeating: 0, count: 12)
-                                for n in 0 ..< 12 {
-                                    windowedShort[n] = subbandWindowed[inputOffset + n] * shortWindowBase[n]
-                                }
-                                for spectralLine in 0 ..< 6 {
-                                    var accumulator = 0.0
-                                    let rowBase = cosineBase.advanced(by: spectralLine * 12)
-                                    for n in 0 ..< 12 {
-                                        accumulator += windowedShort[n] * rowBase[n]
+                                    // Build the 36-sample input from previous overlap (first 18) and current
+                                    // samples (next 18), applying the odd-subband sign flip on the current
+                                    // half just like the long path. Update the overlap buffer for the next granule.
+                                    for index in 0 ..< 18 {
+                                        subbandWindowed[index] = overlapBase[index]
                                     }
-                                    subbandOutput[windowIndex * 6 + spectralLine] = accumulator
+                                    if flipOdd {
+                                        for index in 0 ..< 18 {
+                                            let sampleValue = (index & 1) == 1 ? -inputBase[index] : inputBase[index]
+                                            overlapBase[index] = sampleValue
+                                            subbandWindowed[18 + index] = sampleValue
+                                        }
+                                    } else {
+                                        for index in 0 ..< 18 {
+                                            let sampleValue = inputBase[index]
+                                            overlapBase[index] = sampleValue
+                                            subbandWindowed[18 + index] = sampleValue
+                                        }
+                                    }
+
+                                    // Three short MDCTs: each takes a 12-sample windowed slice starting at
+                                    // offsets 6, 12, 18 of the 36-sample input.
+                                    let subbandOutput = spectral.baseAddress!.advanced(by: subband * 18)
+                                    for windowIndex in 0 ..< 3 {
+                                        let inputOffset = 6 + windowIndex * 6
+                                        for n in 0 ..< 12 {
+                                            windowedShort[n] = subbandWindowed[inputOffset + n] * shortWindowBase[n]
+                                        }
+                                        for spectralLine in 0 ..< 6 {
+                                            var accumulator = 0.0
+                                            let rowBase = cosineBase.advanced(by: spectralLine * 12)
+                                            for n in 0 ..< 12 {
+                                                accumulator += windowedShort[n] * rowBase[n]
+                                            }
+                                            subbandOutput[windowIndex * 6 + spectralLine] = accumulator
+                                        }
+                                    }
                                 }
                             }
-                        }
-
-                        // Copy-out to Float, 4 at a time.
-                        let sourceRaw = UnsafeRawPointer(spectral.baseAddress!)
-                        let destinationRaw = UnsafeMutableRawPointer(output)
-                        for offset in stride(from: 0, to: 576, by: 4) {
-                            let doubles = sourceRaw.load(fromByteOffset: offset * 8, as: SIMD4<Double>.self)
-                            let floats = SIMD4<Float>(Float(doubles[0]), Float(doubles[1]), Float(doubles[2]), Float(doubles[3]))
-                            destinationRaw.storeBytes(of: floats, toByteOffset: offset * 4, as: SIMD4<Float>.self)
                         }
                     }
+                }
+
+                // Copy-out to Float, 4 at a time.
+                let sourceRaw = UnsafeRawPointer(spectral.baseAddress!)
+                let destinationRaw = UnsafeMutableRawPointer(output)
+                for offset in stride(from: 0, to: 576, by: 4) {
+                    let doubles = sourceRaw.load(fromByteOffset: offset * 8, as: SIMD4<Double>.self)
+                    let floats = SIMD4<Float>(Float(doubles[0]), Float(doubles[1]), Float(doubles[2]), Float(doubles[3]))
+                    destinationRaw.storeBytes(of: floats, toByteOffset: offset * 4, as: SIMD4<Float>.self)
                 }
             }
         }

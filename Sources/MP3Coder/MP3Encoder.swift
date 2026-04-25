@@ -5,6 +5,7 @@
 //  Created by GPT 5.5 and Opus 4.7 on 4/23/26.
 //
 
+import Accelerate
 import Foundation
 
 /// MPEG-1 Layer 3 (MP3) Encoder
@@ -24,7 +25,10 @@ public final class MP3Encoder {
     private let filterBanks: [PolyphaseFilterBank]
     private let mdctProcessors: [MDCTProcessor]
     private let psychoModel: PsychoacousticModel
-    private let quantizer: Quantizer
+    /// One quantizer per channel. Each owns its own scratch buffers, so the
+    /// per-channel parallel quantize phase can run them concurrently without
+    /// any cross-task aliasing on the rate-control inner loop.
+    private let quantizers: [Quantizer]
     private let transientDetectors: [TransientDetector]
 
     /// Maps a bitstream slot for short blocks to the matching encoder MDCT slot
@@ -74,6 +78,24 @@ public final class MP3Encoder {
         return try body()
     }
 
+    /// Drain each per-channel quantizer's local counter snapshot into the
+    /// shared profiler. Called after the per-channel parallel quantize phase
+    /// so the merge happens on a single thread with every worker quiescent.
+    @inline(__always)
+    private func drainQuantizerCounters() {
+        guard let profiler else {
+            // Reset the per-quantizer state anyway so counts don't compound
+            // across encoder lifetimes when callers later attach a profiler.
+            for quantizer in quantizers {
+                _ = quantizer.consumeLocalCounters()
+            }
+            return
+        }
+        for quantizer in quantizers {
+            profiler.mergeCounters(quantizer.consumeLocalCounters())
+        }
+    }
+
     // MARK: - Scratch buffers (preallocated in init, reused every frame)
 
     /// Deinterleaved channel samples. Layout: ch * samplesPerFrame + sampleIndex.
@@ -83,8 +105,14 @@ public final class MP3Encoder {
     /// Pre-reorder subband-major MDCT output for short blocks (kept separate so we
     /// don't disturb `granuleSpectralScratch`, which holds the bitstream-order layout).
     private var shortReorderScratch: ContiguousArray<Float>
-    /// Quantized values per (granule, channel). Layout: (gr * channels + ch) * 576 + k.
-    private var granuleQuantizedScratch: [ContiguousArray<Int>]
+    /// Quantized values per (granule, channel). Flat layout
+    /// `(gr * channels + ch) * 576 + k`. A single contiguous buffer (rather
+    /// than `[ContiguousArray<Int>]`) lets the per-channel parallel quantize
+    /// phase grab one buffer pointer at the top of the granule loop and hand
+    /// disjoint sub-ranges to each worker — nesting per-element
+    /// `withUnsafeMutableBufferPointer` blocks would trip Swift's exclusivity
+    /// enforcement on the outer array.
+    private var granuleQuantizedScratch: ContiguousArray<Int>
     /// Per-granule side info, preallocated as [2 * channels].
     private var granuleInfosScratch: [[GranuleInfo]]
     /// Main-data bit writer, reused across frames.
@@ -93,6 +121,12 @@ public final class MP3Encoder {
     private var subbandScratch: ContiguousArray<Double>
     /// 32-slot output buffer for each polyphase filterbank call.
     private var filterBankOutputScratch: ContiguousArray<Double>
+    /// Per-(granule, channel) transient flag, reused per frame.
+    private var transientFlagsScratch: [[Bool]]
+    /// Per-channel transient lookahead flag, reused per frame.
+    private var nextFrameTransientScratch: [Bool]
+    /// Per-(granule, channel) block type chosen during transient resolution.
+    private var blockTypesScratch: [[MDCTBlockType]]
 
     // MARK: - Computed properties
 
@@ -107,6 +141,30 @@ public final class MP3Encoder {
     /// Frame size in bytes (without padding)
     var frameSizeBytes: Int {
         (144 * bitrate * 1000) / sampleRate
+    }
+
+    /// Per-(granule, channel) quantization output, returned from a worker so
+    /// the encoder can write it back to the shared `granuleInfosScratch` and
+    /// `previousLongBlockGain` slots from a single thread after the parallel
+    /// block completes.
+    private struct ChannelQuantizationResult {
+        var info: GranuleInfo
+        var nextLongBlockGain: Int
+    }
+
+    /// `@unchecked Sendable` shim for raw pointers handed into the per-channel
+    /// `concurrentPerform` closure. Each parallel worker writes to a disjoint
+    /// slot, so the unchecked conformance is a contract documented at the
+    /// call site (one slot per worker) rather than a global guarantee.
+    private struct ConcurrentPointer<T>: @unchecked Sendable {
+        var base: UnsafeMutablePointer<T>
+    }
+
+    /// Read-only counterpart to `ConcurrentPointer`. The spectral input is
+    /// shared by both workers but never written, so an unchecked Sendable
+    /// shim is enough to hand it across the @Sendable closure boundary.
+    private struct ConcurrentReadonlyPointer<T>: @unchecked Sendable {
+        var base: UnsafePointer<T>
     }
 
     private struct PendingMP3Frame {
@@ -148,7 +206,7 @@ public final class MP3Encoder {
         filterBanks = (0 ..< channels).map { _ in PolyphaseFilterBank() }
         mdctProcessors = (0 ..< channels).map { _ in MDCTProcessor() }
         psychoModel = PsychoacousticModel(sampleRate: sampleRate)
-        quantizer = Quantizer(sampleRate: sampleRate)
+        quantizers = (0 ..< channels).map { _ in Quantizer(sampleRate: sampleRate) }
         transientDetectors = (0 ..< channels).map { _ in TransientDetector() }
         previousBlockType = Array(repeating: .long, count: channels)
         previousLongBlockGain = Array(repeating: 0, count: channels)
@@ -161,9 +219,7 @@ public final class MP3Encoder {
         channelSamplesScratch = ContiguousArray(repeating: 0, count: channels * spf)
         granuleSpectralScratch = ContiguousArray(repeating: 0, count: 2 * channels * 576)
         shortReorderScratch = ContiguousArray(repeating: 0, count: 576)
-        granuleQuantizedScratch = (0 ..< (2 * channels)).map { _ in
-            ContiguousArray(repeating: 0, count: 576)
-        }
+        granuleQuantizedScratch = ContiguousArray(repeating: 0, count: 2 * channels * 576)
         granuleInfosScratch = (0 ..< 2).map { _ in
             Array(repeating: GranuleInfo(), count: channels)
         }
@@ -171,6 +227,13 @@ public final class MP3Encoder {
         mainDataWriter = BitstreamWriter(reserveBytes: frameBytes)
         subbandScratch = ContiguousArray(repeating: 0, count: 32 * 18)
         filterBankOutputScratch = ContiguousArray(repeating: 0, count: 32)
+        transientFlagsScratch = (0 ..< 2).map { _ in
+            Array(repeating: false, count: channels)
+        }
+        nextFrameTransientScratch = Array(repeating: false, count: channels)
+        blockTypesScratch = (0 ..< 2).map { _ in
+            Array(repeating: .long, count: channels)
+        }
     }
 
     // MARK: - Public API
@@ -265,11 +328,14 @@ public final class MP3Encoder {
         // Per-(granule, channel) transient flag from PCM. Granule 0/1 of this frame
         // come from `channelSamplesScratch`; the lookahead needed for granule 1 lives
         // one granule past the frame's end in `inputBuffer`.
-        var transientFlags: [[Bool]] = [
-            Array(repeating: false, count: channels),
-            Array(repeating: false, count: channels),
-        ]
-        var nextFrameTransient: [Bool] = Array(repeating: false, count: channels)
+        for granule in 0 ..< 2 {
+            for channel in 0 ..< channels {
+                transientFlagsScratch[granule][channel] = false
+            }
+        }
+        for channel in 0 ..< channels {
+            nextFrameTransientScratch[channel] = false
+        }
 
         measure(.transient) {
             channelSamplesScratch.withUnsafeBufferPointer { channelBuffer in
@@ -278,7 +344,7 @@ public final class MP3Encoder {
                     let channelOffset = channel * samplesPerFrameCount
                     for granule in 0 ..< 2 {
                         let granuleOffset = channelOffset + granule * samplesPerGranule
-                        transientFlags[granule][channel] = transientDetectors[channel].detectTransient(
+                        transientFlagsScratch[granule][channel] = transientDetectors[channel].detectTransient(
                             pcm: channelBase.advanced(by: granuleOffset),
                             samplesPerGranule: samplesPerGranule
                         )
@@ -291,14 +357,14 @@ public final class MP3Encoder {
                 inputBuffer.withUnsafeBufferPointer { inputRegion in
                     let lookaheadBase = inputRegion.baseAddress! + sampleBase + samplesPerFrameCount * channels
                     if channels == 1 {
-                        nextFrameTransient[0] = transientPreview(
+                        nextFrameTransientScratch[0] = transientPreview(
                             pcm: lookaheadBase,
                             stride: 1,
                             channel: 0
                         )
                     } else {
                         for channel in 0 ..< channels {
-                            nextFrameTransient[channel] = transientPreview(
+                            nextFrameTransientScratch[channel] = transientPreview(
                                 pcm: lookaheadBase + channel,
                                 stride: 2,
                                 channel: channel
@@ -310,29 +376,25 @@ public final class MP3Encoder {
         }
 
         let baseTargetBits = max(0, (mainDataBytesForCurrentFrame * 8) / (2 * channels))
-        var reservoirBitsRemaining = min(reservoir, maxReservoir)
+        let reservoirBitsRemaining = min(reservoir, maxReservoir)
 
         // Resolve block types for the four (granule, channel) slots before MDCT, so
         // we can hand the right block type to each MDCT call.
-        var blockTypes: [[MDCTBlockType]] = [
-            Array(repeating: .long, count: channels),
-            Array(repeating: .long, count: channels),
-        ]
         for channel in 0 ..< channels {
             var prev = previousBlockType[channel]
             for granule in 0 ..< 2 {
-                let curr = transientFlags[granule][channel]
+                let curr = transientFlagsScratch[granule][channel]
                 let next: Bool = if granule == 0 {
-                    transientFlags[1][channel]
+                    transientFlagsScratch[1][channel]
                 } else {
-                    nextFrameTransient[channel]
+                    nextFrameTransientScratch[channel]
                 }
                 let blockType = nextBlockType(
                     previous: prev,
                     currentTransient: curr,
                     nextTransient: next
                 )
-                blockTypes[granule][channel] = blockType
+                blockTypesScratch[granule][channel] = blockType
                 prev = blockType
             }
         }
@@ -369,7 +431,7 @@ public final class MP3Encoder {
                     }
                 }
 
-                let blockType = blockTypes[granule][channel]
+                let blockType = blockTypesScratch[granule][channel]
                 let spectralBase = (granule * channels + channel) * 576
 
                 measure(.mdct) {
@@ -423,7 +485,7 @@ public final class MP3Encoder {
         // must also share a block type since M/S is applied bin-for-bin and
         // requires matching MDCT layouts on the two channels.
         let useMidSide = measure(.midSideDecision) {
-            decideMidSideStereo(blockTypes: blockTypes)
+            decideMidSideStereo(blockTypes: blockTypesScratch)
         }
         if useMidSide {
             measure(.midSideTransform) {
@@ -432,93 +494,204 @@ public final class MP3Encoder {
         }
 
         // Phase 3: quantize each (granule, channel) using the (possibly transformed)
-        // spectral data.
+        // spectral data. Per-channel work runs in parallel via
+        // `DispatchQueue.concurrentPerform`; the per-channel `previousLongBlockGain`
+        // chain still feeds granule 0 → granule 1 of the same channel sequentially.
+        //
+        // Reservoir is split equally across the four (granule, channel) slots
+        // up-front so each worker has an independent bit budget. This deliberately
+        // diverges from the legacy serial accumulation (which biased the early
+        // slots) — the total reservoir spend per frame is the same, but the
+        // distribution is now deterministic per slot rather than depending on
+        // how the previous slots happened to consume.
+        let reservoirSlotShare = max(0, reservoirBitsRemaining) / max(1, 2 * channels)
         for granule in 0 ..< 2 {
-            for channel in 0 ..< channels {
-                let blockType = blockTypes[granule][channel]
-                let spectralBase = (granule * channels + channel) * 576
-
-                var granuleInfo = GranuleInfo()
-                granuleInfo.blockType = blockType.rawValue
-                granuleInfo.windowSwitchingFlag = blockType != .long
-                granuleInfo.mixedBlockFlag = false
-                // Region splits for `window_switching_flag = 1` granules are *not*
-                // carried in the bitstream — the decoder hardcodes them based on
-                // block_type (see `MP3Decoder` side-info reader). The encoder must
-                // use the matching values:
-                //   • start / stop blocks: 7 / 13   (region 2 effectively empty)
-                //   • pure short blocks:    8 / 12  (region 2 effectively empty)
-                // For long blocks the bitstream carries region0/1_count so we keep
-                // the prior 10 / 3 default. Mismatching these on start/stop blocks
-                // misaligns every transient's Huffman bits with the decoder, which
-                // shows up audibly as localized scratchy / scattaly noise around
-                // each short-block group.
-                switch blockType {
-                case .shortBlocks:
-                    granuleInfo.region0Count = 8
-                    granuleInfo.region1Count = 12
-                case .start, .stop:
-                    granuleInfo.region0Count = 7
-                    granuleInfo.region1Count = 13
-                case .long:
-                    granuleInfo.region0Count = 10
-                    granuleInfo.region1Count = 3
-                }
-
-                // The quantizer treats `globalGain == 0` as "no smoothing hint";
-                // overwriting the GranuleInfo struct default (210) ensures the
-                // smoothing path only fires when we explicitly seed it below.
-                granuleInfo.globalGain = 0
-                // For consecutive long blocks on the same channel, seed the gain
-                // with the previous granule's chosen value. The quantizer clamps
-                // the new gain no further below it than `gainSmoothingMaxDelta`,
-                // suppressing frame-rate noise-floor flutter on steady-state
-                // content. Short/start/stop blocks have their own per-window gain
-                // dynamics (subblock_gain), so we deliberately leave those
-                // un-smoothed.
-                if blockType == .long, previousLongBlockGain[channel] > 0 {
-                    granuleInfo.globalGain = previousLongBlockGain[channel]
-                }
-
-                let huffmanBits = granuleSpectralScratch.withUnsafeBufferPointer { spectralSource in
-                    let spectralSlice = UnsafeBufferPointer(
-                        start: spectralSource.baseAddress!.advanced(by: spectralBase),
-                        count: 576
-                    )
-                    let thresholds = measure(.psychoacoustic) {
-                        psychoModel.computeThresholds(spectral: spectralSlice)
-                    }
-                    return granuleQuantizedScratch[granule * channels + channel].withUnsafeMutableBufferPointer { destination in
-                        measure(.quantize) {
-                            quantizer.outerLoop(
-                                spectral: spectralSlice,
-                                thresholds: thresholds,
-                                targetBits: baseTargetBits,
-                                reservoirBits: reservoirBitsRemaining,
-                                destination: destination,
-                                granuleInfo: &granuleInfo
-                            )
-                        }
-                    }
-                }
-
-                granuleInfo.part2_3_length = granuleInfo.part2Length + huffmanBits
-                reservoirBitsRemaining = max(0, reservoirBitsRemaining - max(0, granuleInfo.part2_3_length - baseTargetBits))
-                granuleInfosScratch[granule][channel] = granuleInfo
-
-                // Update the long-block gain hint for the next granule on this channel.
-                // Reset to 0 (no hint) for non-long blocks so the next long block after a
-                // short run starts fresh — the spectral content shape after a transient
-                // is usually quite different from before it.
-                if blockType == .long {
-                    previousLongBlockGain[channel] = granuleInfo.globalGain
-                } else {
-                    previousLongBlockGain[channel] = 0
-                }
-            }
+            quantizeGranule(
+                granule: granule,
+                baseTargetBits: baseTargetBits,
+                reservoirSlotShare: reservoirSlotShare
+            )
         }
 
+        // Per-quantizer counter snapshots are merged here on the encoder thread
+        // now that every concurrent worker has finished — never inside the
+        // parallel block, where two workers would race on profiler storage.
+        drainQuantizerCounters()
+
         return writeBitstream(useMidSide: useMidSide)
+    }
+
+    /// Quantize one granule's (channel) slots in parallel. Mono falls through
+    /// to the inline path; stereo uses `concurrentPerform` over the two
+    /// channels with both per-quantizer scratch and per-(granule, channel)
+    /// destination buffers pre-extracted so the @Sendable closure only
+    /// captures `@unchecked Sendable` raw pointers + value types.
+    private func quantizeGranule(granule: Int, baseTargetBits: Int, reservoirSlotShare: Int) {
+        let psychoModelLocal = psychoModel
+        let channelsLocal = channels
+
+        if channels == 1 {
+            granuleSpectralScratch.withUnsafeBufferPointer { spectralSource in
+                granuleQuantizedScratch.withUnsafeMutableBufferPointer { quantizedBuffer in
+                    let destination = UnsafeMutableBufferPointer(
+                        start: quantizedBuffer.baseAddress!.advanced(by: granule * 576),
+                        count: 576
+                    )
+                    let result = Self.quantizeChannelSlot(
+                        granule: granule,
+                        channel: 0,
+                        channels: channelsLocal,
+                        blockType: blockTypesScratch[granule][0],
+                        spectralBase: spectralSource.baseAddress!,
+                        psychoModel: psychoModelLocal,
+                        quantizer: quantizers[0],
+                        baseTargetBits: baseTargetBits,
+                        reservoirShareBits: reservoirSlotShare,
+                        previousLongGain: previousLongBlockGain[0],
+                        destination: destination
+                    )
+                    granuleInfosScratch[granule][0] = result.info
+                    previousLongBlockGain[0] = result.nextLongBlockGain
+                }
+            }
+            return
+        }
+
+        // Stereo — run both channels concurrently. Pre-extract everything the
+        // worker closure needs into local Sendable values (block types, prior
+        // gains, quantizer references, raw pointers) so we never reach back
+        // into `self`-owned mutable storage from inside the @Sendable closure.
+        let blockType0 = blockTypesScratch[granule][0]
+        let blockType1 = blockTypesScratch[granule][1]
+        let priorGain0 = previousLongBlockGain[0]
+        let priorGain1 = previousLongBlockGain[1]
+        let quantizer0 = quantizers[0]
+        let quantizer1 = quantizers[1]
+        let granuleLocal = granule
+        let baseTargetBitsLocal = baseTargetBits
+        let reservoirShareLocal = reservoirSlotShare
+
+        granuleSpectralScratch.withUnsafeBufferPointer { spectralSource in
+            granuleQuantizedScratch.withUnsafeMutableBufferPointer { quantizedBuffer in
+                let quantizedSlot = ConcurrentPointer(base: quantizedBuffer.baseAddress!)
+                let spectralSlot = ConcurrentReadonlyPointer(base: spectralSource.baseAddress!)
+
+                let resultsBox = UnsafeMutablePointer<ChannelQuantizationResult>.allocate(capacity: 2)
+                defer { resultsBox.deallocate() }
+                let resultsSlot = ConcurrentPointer(base: resultsBox)
+
+                DispatchQueue.concurrentPerform(iterations: 2) { channel in
+                    let blockType = channel == 0 ? blockType0 : blockType1
+                    let priorGain = channel == 0 ? priorGain0 : priorGain1
+                    let quantizer = channel == 0 ? quantizer0 : quantizer1
+                    let destination = UnsafeMutableBufferPointer(
+                        start: quantizedSlot.base.advanced(by: (granuleLocal * 2 + channel) * 576),
+                        count: 576
+                    )
+                    let result = Self.quantizeChannelSlot(
+                        granule: granuleLocal,
+                        channel: channel,
+                        channels: 2,
+                        blockType: blockType,
+                        spectralBase: spectralSlot.base,
+                        psychoModel: psychoModelLocal,
+                        quantizer: quantizer,
+                        baseTargetBits: baseTargetBitsLocal,
+                        reservoirShareBits: reservoirShareLocal,
+                        previousLongGain: priorGain,
+                        destination: destination
+                    )
+                    resultsSlot.base.advanced(by: channel).initialize(to: result)
+                }
+
+                granuleInfosScratch[granule][0] = resultsBox[0].info
+                granuleInfosScratch[granule][1] = resultsBox[1].info
+                previousLongBlockGain[0] = resultsBox[0].nextLongBlockGain
+                previousLongBlockGain[1] = resultsBox[1].nextLongBlockGain
+                resultsBox.deinitialize(count: 2)
+            }
+        }
+    }
+
+    /// Per-(granule, channel) quantization core. Static so the parallel block
+    /// can call it without capturing the encoder — every input arrives by
+    /// value or as a `@unchecked Sendable` raw pointer.
+    private static func quantizeChannelSlot(
+        granule: Int,
+        channel: Int,
+        channels: Int,
+        blockType: MDCTBlockType,
+        spectralBase: UnsafePointer<Float>,
+        psychoModel: PsychoacousticModel,
+        quantizer: Quantizer,
+        baseTargetBits: Int,
+        reservoirShareBits: Int,
+        previousLongGain: Int,
+        destination: UnsafeMutableBufferPointer<Int>
+    ) -> ChannelQuantizationResult {
+        var granuleInfo = GranuleInfo()
+        granuleInfo.blockType = blockType.rawValue
+        granuleInfo.windowSwitchingFlag = blockType != .long
+        granuleInfo.mixedBlockFlag = false
+        // Region splits for `window_switching_flag = 1` granules are *not*
+        // carried in the bitstream — the decoder hardcodes them based on
+        // block_type (see `MP3Decoder` side-info reader). The encoder must
+        // use the matching values:
+        //   • start / stop blocks: 7 / 13   (region 2 effectively empty)
+        //   • pure short blocks:    8 / 12  (region 2 effectively empty)
+        // For long blocks the bitstream carries region0/1_count so we keep
+        // the prior 10 / 3 default. Mismatching these on start/stop blocks
+        // misaligns every transient's Huffman bits with the decoder, which
+        // shows up audibly as localized scratchy / scattaly noise around
+        // each short-block group.
+        switch blockType {
+        case .shortBlocks:
+            granuleInfo.region0Count = 8
+            granuleInfo.region1Count = 12
+        case .start, .stop:
+            granuleInfo.region0Count = 7
+            granuleInfo.region1Count = 13
+        case .long:
+            granuleInfo.region0Count = 10
+            granuleInfo.region1Count = 3
+        }
+
+        // The quantizer treats `globalGain == 0` as "no smoothing hint";
+        // overwriting the GranuleInfo struct default (210) ensures the
+        // smoothing path only fires when we explicitly seed it below.
+        granuleInfo.globalGain = 0
+        // For consecutive long blocks on the same channel, seed the gain
+        // with the previous granule's chosen value. The quantizer clamps
+        // the new gain no further below it than `gainSmoothingMaxDelta`,
+        // suppressing frame-rate noise-floor flutter on steady-state
+        // content. Short/start/stop blocks have their own per-window gain
+        // dynamics (subblock_gain), so we deliberately leave those
+        // un-smoothed.
+        if blockType == .long, previousLongGain > 0 {
+            granuleInfo.globalGain = previousLongGain
+        }
+
+        let spectralSlice = UnsafeBufferPointer(
+            start: spectralBase.advanced(by: (granule * channels + channel) * 576),
+            count: 576
+        )
+        let thresholds = psychoModel.computeThresholds(spectral: spectralSlice)
+        let huffmanBits = quantizer.outerLoop(
+            spectral: spectralSlice,
+            thresholds: thresholds,
+            targetBits: baseTargetBits,
+            reservoirBits: reservoirShareBits,
+            destination: destination,
+            granuleInfo: &granuleInfo
+        )
+
+        granuleInfo.part2_3_length = granuleInfo.part2Length + huffmanBits
+        // Update the long-block gain hint for the next granule on this channel.
+        // Reset to 0 (no hint) for non-long blocks so the next long block after a
+        // short run starts fresh — the spectral content shape after a transient
+        // is usually quite different from before it.
+        let nextLongBlockGain = blockType == .long ? granuleInfo.globalGain : 0
+        return ChannelQuantizationResult(info: granuleInfo, nextLongBlockGain: nextLongBlockGain)
     }
 
     /// Pick L/R vs M/S for the whole frame. M/S only fires for stereo when both
@@ -630,27 +803,24 @@ public final class MP3Encoder {
         stride sampleStride: Int,
         channel _: Int
     ) -> Bool {
-        // De-interleave into a per-channel scratch of the right length, then run
-        // the same heuristic the detector uses without storing previous-energy state.
+        // Strided sum-of-squares directly on the interleaved input — no de-interleave
+        // copy. The detector is a heuristic so single-precision accumulation is fine.
         let granuleSamples = samplesPerGranule
-        var monoScratch = [Float](repeating: 0, count: granuleSamples)
-        for index in 0 ..< granuleSamples {
-            monoScratch[index] = pcm[index * sampleStride]
-        }
         let subWindowSize = granuleSamples / 3
         guard subWindowSize > 0 else {
             return false
         }
+        let length = vDSP_Length(subWindowSize)
+        let stride = vDSP_Stride(sampleStride)
+        let inverseLength = 1.0 / Double(subWindowSize)
+
         var maxEnergy = 0.0
         var minEnergy = Double.greatestFiniteMagnitude
         for windowIndex in 0 ..< 3 {
-            var energy = 0.0
-            let start = windowIndex * subWindowSize
-            for sampleIndex in 0 ..< subWindowSize {
-                let value = Double(monoScratch[start + sampleIndex])
-                energy += value * value
-            }
-            energy /= Double(subWindowSize)
+            let start = windowIndex * subWindowSize * sampleStride
+            var sumOfSquares: Float = 0
+            vDSP_svesq(pcm.advanced(by: start), stride, &sumOfSquares, length)
+            let energy = Double(sumOfSquares) * inverseLength
             if energy > maxEnergy {
                 maxEnergy = energy
             }
@@ -677,12 +847,17 @@ public final class MP3Encoder {
         // Write main data (scale factors + Huffman)
         let mainDataRaw: Data = measure(.writeMainData) {
             mainDataWriter.reset()
-            for granule in 0 ..< 2 {
-                for channel in 0 ..< channels {
-                    let granuleInfo = granuleInfosScratch[granule][channel]
-                    writeScaleFactors(writer: mainDataWriter, granuleInfo: granuleInfo)
-                    granuleQuantizedScratch[granule * channels + channel].withUnsafeBufferPointer { quantizedBuffer in
-                        writeHuffman(writer: mainDataWriter, quantized: quantizedBuffer, granuleInfo: granuleInfo)
+            granuleQuantizedScratch.withUnsafeBufferPointer { quantizedBuffer in
+                let base = quantizedBuffer.baseAddress!
+                for granule in 0 ..< 2 {
+                    for channel in 0 ..< channels {
+                        let granuleInfo = granuleInfosScratch[granule][channel]
+                        writeScaleFactors(writer: mainDataWriter, granuleInfo: granuleInfo)
+                        let slice = UnsafeBufferPointer(
+                            start: base.advanced(by: (granule * channels + channel) * 576),
+                            count: 576
+                        )
+                        writeHuffman(writer: mainDataWriter, quantized: slice, granuleInfo: granuleInfo)
                     }
                 }
             }
@@ -896,13 +1071,14 @@ public final class MP3Encoder {
 
     // MARK: - Scale factor writing
 
-    private func writeScaleFactors(writer: BitstreamWriter, granuleInfo: GranuleInfo) {
-        let lowBitLengths = [0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4]
-        let highBitLengths = [0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3]
+    // ISO 11172-3 Table B.6 (scalefac_compress): see matching table in `Quantizer`.
+    private static let scaleFactorBitLengthsLow: [Int] = [0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4]
+    private static let scaleFactorBitLengthsHigh: [Int] = [0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3]
 
+    private func writeScaleFactors(writer: BitstreamWriter, granuleInfo: GranuleInfo) {
         let compressIndex = min(granuleInfo.scaleFactorCompress, 15)
-        let lowBitLength = lowBitLengths[compressIndex]
-        let highBitLength = highBitLengths[compressIndex]
+        let lowBitLength = Self.scaleFactorBitLengthsLow[compressIndex]
+        let highBitLength = Self.scaleFactorBitLengthsHigh[compressIndex]
 
         if granuleInfo.blockType == MDCTBlockType.shortBlocks.rawValue {
             // Pure short blocks: 6 short-bands × 3 windows at lowBitLength, then
