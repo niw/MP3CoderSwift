@@ -58,6 +58,22 @@ public final class MP3Encoder {
     private let maxReservoir: Int = 511 * 8 // MPEG1: 9-bit main_data_begin
     private var pendingFrame: PendingMP3Frame?
 
+    // MARK: - Profiling
+
+    /// Optional per-stage wall-clock profiler. `nil` by default — when unset,
+    /// the per-phase wrappers compile down to a direct call and the encoder
+    /// runs at full speed. Assign a fresh `MP3EncoderProfiler` before encoding
+    /// to opt in.
+    public var profiler: MP3EncoderProfiler?
+
+    @inline(__always)
+    private func measure<T>(_ phase: MP3EncoderProfiler.Phase, _ body: () throws -> T) rethrows -> T {
+        if let profiler {
+            return try profiler.measure(phase, body)
+        }
+        return try body()
+    }
+
     // MARK: - Scratch buffers (preallocated in init, reused every frame)
 
     /// Deinterleaved channel samples. Layout: ch * samplesPerFrame + sampleIndex.
@@ -183,7 +199,10 @@ public final class MP3Encoder {
         }
 
         if let pendingFrame {
-            output.append(renderFrame(pendingFrame, futureMainDataPrefix: Data()))
+            let rendered = measure(.writeHeaderSideInfo) {
+                renderFrame(pendingFrame, futureMainDataPrefix: Data())
+            }
+            output.append(rendered)
             self.pendingFrame = nil
             reservoir = 0
         }
@@ -219,22 +238,25 @@ public final class MP3Encoder {
     // MARK: - Frame encoding
 
     private func encodeFrame(sampleBase: Int, hasLookahead: Bool) -> Data {
+        profiler?.recordFrame(samples: samplesPerFrame)
         let samplesPerFrameCount = samplesPerFrame
         // Deinterleave into channelSamplesScratch[channel * samplesPerFrame + sampleIndex]
-        channelSamplesScratch.withUnsafeMutableBufferPointer { channelBuffer in
-            inputBuffer.withUnsafeBufferPointer { inputRegion in
-                let inputBase = inputRegion.baseAddress! + sampleBase
-                if channels == 1 {
-                    for sampleIndex in 0 ..< samplesPerFrameCount {
-                        channelBuffer[sampleIndex] = inputBase[sampleIndex]
-                    }
-                } else {
-                    // Stereo interleaved L,R,L,R…
-                    let leftOutput = channelBuffer.baseAddress!
-                    let rightOutput = channelBuffer.baseAddress! + samplesPerFrameCount
-                    for sampleIndex in 0 ..< samplesPerFrameCount {
-                        leftOutput[sampleIndex] = inputBase[2 * sampleIndex]
-                        rightOutput[sampleIndex] = inputBase[2 * sampleIndex + 1]
+        measure(.deinterleave) {
+            channelSamplesScratch.withUnsafeMutableBufferPointer { channelBuffer in
+                inputBuffer.withUnsafeBufferPointer { inputRegion in
+                    let inputBase = inputRegion.baseAddress! + sampleBase
+                    if channels == 1 {
+                        for sampleIndex in 0 ..< samplesPerFrameCount {
+                            channelBuffer[sampleIndex] = inputBase[sampleIndex]
+                        }
+                    } else {
+                        // Stereo interleaved L,R,L,R…
+                        let leftOutput = channelBuffer.baseAddress!
+                        let rightOutput = channelBuffer.baseAddress! + samplesPerFrameCount
+                        for sampleIndex in 0 ..< samplesPerFrameCount {
+                            leftOutput[sampleIndex] = inputBase[2 * sampleIndex]
+                            rightOutput[sampleIndex] = inputBase[2 * sampleIndex + 1]
+                        }
                     }
                 }
             }
@@ -249,37 +271,39 @@ public final class MP3Encoder {
         ]
         var nextFrameTransient: [Bool] = Array(repeating: false, count: channels)
 
-        channelSamplesScratch.withUnsafeBufferPointer { channelBuffer in
-            let channelBase = channelBuffer.baseAddress!
-            for channel in 0 ..< channels {
-                let channelOffset = channel * samplesPerFrameCount
-                for granule in 0 ..< 2 {
-                    let granuleOffset = channelOffset + granule * samplesPerGranule
-                    transientFlags[granule][channel] = transientDetectors[channel].detectTransient(
-                        pcm: channelBase.advanced(by: granuleOffset),
-                        samplesPerGranule: samplesPerGranule
-                    )
+        measure(.transient) {
+            channelSamplesScratch.withUnsafeBufferPointer { channelBuffer in
+                let channelBase = channelBuffer.baseAddress!
+                for channel in 0 ..< channels {
+                    let channelOffset = channel * samplesPerFrameCount
+                    for granule in 0 ..< 2 {
+                        let granuleOffset = channelOffset + granule * samplesPerGranule
+                        transientFlags[granule][channel] = transientDetectors[channel].detectTransient(
+                            pcm: channelBase.advanced(by: granuleOffset),
+                            samplesPerGranule: samplesPerGranule
+                        )
+                    }
                 }
             }
-        }
 
-        if hasLookahead {
-            // Peek (don't consume) one more granule to drive granule-1's lookahead.
-            inputBuffer.withUnsafeBufferPointer { inputRegion in
-                let lookaheadBase = inputRegion.baseAddress! + sampleBase + samplesPerFrameCount * channels
-                if channels == 1 {
-                    nextFrameTransient[0] = transientPreview(
-                        pcm: lookaheadBase,
-                        stride: 1,
-                        channel: 0
-                    )
-                } else {
-                    for channel in 0 ..< channels {
-                        nextFrameTransient[channel] = transientPreview(
-                            pcm: lookaheadBase + channel,
-                            stride: 2,
-                            channel: channel
+            if hasLookahead {
+                // Peek (don't consume) one more granule to drive granule-1's lookahead.
+                inputBuffer.withUnsafeBufferPointer { inputRegion in
+                    let lookaheadBase = inputRegion.baseAddress! + sampleBase + samplesPerFrameCount * channels
+                    if channels == 1 {
+                        nextFrameTransient[0] = transientPreview(
+                            pcm: lookaheadBase,
+                            stride: 1,
+                            channel: 0
                         )
+                    } else {
+                        for channel in 0 ..< channels {
+                            nextFrameTransient[channel] = transientPreview(
+                                pcm: lookaheadBase + channel,
+                                stride: 2,
+                                channel: channel
+                            )
+                        }
                     }
                 }
             }
@@ -323,20 +347,22 @@ public final class MP3Encoder {
 
             for channel in 0 ..< channels {
                 let channelSampleBase = channel * samplesPerFrameCount
-                channelSamplesScratch.withUnsafeBufferPointer { channelBuffer in
-                    filterBankOutputScratch.withUnsafeMutableBufferPointer { filterBankOutput in
-                        subbandScratch.withUnsafeMutableBufferPointer { subbandBuffer in
-                            let channelBase = channelBuffer.baseAddress!
-                            for slot in 0 ..< 18 {
-                                let sampleOffset = channelSampleBase + granuleSampleOffset + slot * 32
-                                filterBanks[channel].analyze(
-                                    input: channelBase,
-                                    inputOffset: sampleOffset,
-                                    inputLength: channelBuffer.count,
-                                    output: filterBankOutput.baseAddress!
-                                )
-                                for subband in 0 ..< 32 {
-                                    subbandBuffer[subband * 18 + slot] = filterBankOutput[subband]
+                measure(.filterBank) {
+                    channelSamplesScratch.withUnsafeBufferPointer { channelBuffer in
+                        filterBankOutputScratch.withUnsafeMutableBufferPointer { filterBankOutput in
+                            subbandScratch.withUnsafeMutableBufferPointer { subbandBuffer in
+                                let channelBase = channelBuffer.baseAddress!
+                                for slot in 0 ..< 18 {
+                                    let sampleOffset = channelSampleBase + granuleSampleOffset + slot * 32
+                                    filterBanks[channel].analyze(
+                                        input: channelBase,
+                                        inputOffset: sampleOffset,
+                                        inputLength: channelBuffer.count,
+                                        output: filterBankOutput.baseAddress!
+                                    )
+                                    for subband in 0 ..< 32 {
+                                        subbandBuffer[subband * 18 + slot] = filterBankOutput[subband]
+                                    }
                                 }
                             }
                         }
@@ -346,39 +372,41 @@ public final class MP3Encoder {
                 let blockType = blockTypes[granule][channel]
                 let spectralBase = (granule * channels + channel) * 576
 
-                if blockType == .shortBlocks {
-                    subbandScratch.withUnsafeBufferPointer { subbandBuffer in
-                        shortReorderScratch.withUnsafeMutableBufferPointer { reorderBuffer in
-                            mdctProcessors[channel].processGranule(
-                                subbandSamples: subbandBuffer.baseAddress!,
-                                blockType: .shortBlocks,
-                                output: reorderBuffer.baseAddress!
-                            )
-                            for index in 0 ..< 576 {
-                                reorderBuffer[index] *= spectralScale
-                            }
-                            granuleSpectralScratch.withUnsafeMutableBufferPointer { destination in
-                                let outputSlice = destination.baseAddress!.advanced(by: spectralBase)
-                                shortReorderTable.withUnsafeBufferPointer { reorderIndices in
-                                    let reorderBase = reorderIndices.baseAddress!
-                                    for bitstreamIndex in 0 ..< 576 {
-                                        outputSlice[bitstreamIndex] = reorderBuffer[reorderBase[bitstreamIndex]]
+                measure(.mdct) {
+                    if blockType == .shortBlocks {
+                        subbandScratch.withUnsafeBufferPointer { subbandBuffer in
+                            shortReorderScratch.withUnsafeMutableBufferPointer { reorderBuffer in
+                                mdctProcessors[channel].processGranule(
+                                    subbandSamples: subbandBuffer.baseAddress!,
+                                    blockType: .shortBlocks,
+                                    output: reorderBuffer.baseAddress!
+                                )
+                                for index in 0 ..< 576 {
+                                    reorderBuffer[index] *= spectralScale
+                                }
+                                granuleSpectralScratch.withUnsafeMutableBufferPointer { destination in
+                                    let outputSlice = destination.baseAddress!.advanced(by: spectralBase)
+                                    shortReorderTable.withUnsafeBufferPointer { reorderIndices in
+                                        let reorderBase = reorderIndices.baseAddress!
+                                        for bitstreamIndex in 0 ..< 576 {
+                                            outputSlice[bitstreamIndex] = reorderBuffer[reorderBase[bitstreamIndex]]
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                } else {
-                    subbandScratch.withUnsafeBufferPointer { subbandBuffer in
-                        granuleSpectralScratch.withUnsafeMutableBufferPointer { destination in
-                            mdctProcessors[channel].processGranule(
-                                subbandSamples: subbandBuffer.baseAddress!,
-                                blockType: blockType,
-                                output: destination.baseAddress!.advanced(by: spectralBase)
-                            )
-                            let outputSlice = destination.baseAddress!.advanced(by: spectralBase)
-                            for spectralIndex in 0 ..< 576 {
-                                outputSlice[spectralIndex] *= spectralScale
+                    } else {
+                        subbandScratch.withUnsafeBufferPointer { subbandBuffer in
+                            granuleSpectralScratch.withUnsafeMutableBufferPointer { destination in
+                                mdctProcessors[channel].processGranule(
+                                    subbandSamples: subbandBuffer.baseAddress!,
+                                    blockType: blockType,
+                                    output: destination.baseAddress!.advanced(by: spectralBase)
+                                )
+                                let outputSlice = destination.baseAddress!.advanced(by: spectralBase)
+                                for spectralIndex in 0 ..< 576 {
+                                    outputSlice[spectralIndex] *= spectralScale
+                                }
                             }
                         }
                     }
@@ -394,9 +422,13 @@ public final class MP3Encoder {
         // correlation. M/S only makes sense for stereo; both granules in the frame
         // must also share a block type since M/S is applied bin-for-bin and
         // requires matching MDCT layouts on the two channels.
-        let useMidSide = decideMidSideStereo(blockTypes: blockTypes)
+        let useMidSide = measure(.midSideDecision) {
+            decideMidSideStereo(blockTypes: blockTypes)
+        }
         if useMidSide {
-            applyMidSideTransform()
+            measure(.midSideTransform) {
+                applyMidSideTransform()
+            }
         }
 
         // Phase 3: quantize each (granule, channel) using the (possibly transformed)
@@ -453,16 +485,20 @@ public final class MP3Encoder {
                         start: spectralSource.baseAddress!.advanced(by: spectralBase),
                         count: 576
                     )
-                    let thresholds = psychoModel.computeThresholds(spectral: spectralSlice)
+                    let thresholds = measure(.psychoacoustic) {
+                        psychoModel.computeThresholds(spectral: spectralSlice)
+                    }
                     return granuleQuantizedScratch[granule * channels + channel].withUnsafeMutableBufferPointer { destination in
-                        quantizer.outerLoop(
-                            spectral: spectralSlice,
-                            thresholds: thresholds,
-                            targetBits: baseTargetBits,
-                            reservoirBits: reservoirBitsRemaining,
-                            destination: destination,
-                            granuleInfo: &granuleInfo
-                        )
+                        measure(.quantize) {
+                            quantizer.outerLoop(
+                                spectral: spectralSlice,
+                                thresholds: thresholds,
+                                targetBits: baseTargetBits,
+                                reservoirBits: reservoirBitsRemaining,
+                                destination: destination,
+                                granuleInfo: &granuleInfo
+                            )
+                        }
                     }
                 }
 
@@ -639,18 +675,20 @@ public final class MP3Encoder {
         let mainDataBytes = frameSize - headerBytes - sideInfoBytes
 
         // Write main data (scale factors + Huffman)
-        mainDataWriter.reset()
-        for granule in 0 ..< 2 {
-            for channel in 0 ..< channels {
-                let granuleInfo = granuleInfosScratch[granule][channel]
-                writeScaleFactors(writer: mainDataWriter, granuleInfo: granuleInfo)
-                granuleQuantizedScratch[granule * channels + channel].withUnsafeBufferPointer { quantizedBuffer in
-                    writeHuffman(writer: mainDataWriter, quantized: quantizedBuffer, granuleInfo: granuleInfo)
+        let mainDataRaw: Data = measure(.writeMainData) {
+            mainDataWriter.reset()
+            for granule in 0 ..< 2 {
+                for channel in 0 ..< channels {
+                    let granuleInfo = granuleInfosScratch[granule][channel]
+                    writeScaleFactors(writer: mainDataWriter, granuleInfo: granuleInfo)
+                    granuleQuantizedScratch[granule * channels + channel].withUnsafeBufferPointer { quantizedBuffer in
+                        writeHuffman(writer: mainDataWriter, quantized: quantizedBuffer, granuleInfo: granuleInfo)
+                    }
                 }
             }
+            mainDataWriter.byteAlign()
+            return mainDataWriter.toData()
         }
-        mainDataWriter.byteAlign()
-        let mainDataRaw = mainDataWriter.toData()
 
         // Channel mode: mono → 3 (mono), stereo + M/S → 1 (jointStereo) with
         // mode_extension bit 1 set (M/S on, intensity stereo off), stereo + L/R → 0
@@ -682,7 +720,10 @@ public final class MP3Encoder {
         if let previousFrame = pendingFrame {
             let carriedBytes = min(previousFrame.availableReservoirBytes, currentFrame.mainData.count, maxReservoir / 8)
             currentFrame.mainDataBegin = carriedBytes
-            output.append(renderFrame(previousFrame, futureMainDataPrefix: currentFrame.mainData.prefix(carriedBytes)))
+            let rendered = measure(.writeHeaderSideInfo) {
+                renderFrame(previousFrame, futureMainDataPrefix: currentFrame.mainData.prefix(carriedBytes))
+            }
+            output.append(rendered)
         }
 
         pendingFrame = currentFrame
