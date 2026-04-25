@@ -15,6 +15,12 @@ import Foundation
 /// `vvsqrtf` calls + one `vDSP_vmul` over 576 values.
 final class Quantizer {
     let scaleFactorBandBounds: [Int]
+    /// Per bitstream slot, which short window (0..2) owns it. Used by `outerLoopShort`
+    /// to compute per-window energy and pre-scale by 2^(2*sg_w).
+    private let shortWindowTable: [Int]
+    /// Per bitstream slot, which short scale-factor band (0..11) owns it. Used by
+    /// the short-block per-(window, band) scale factor optimization.
+    private let shortBandTable: [Int]
 
     // MARK: - Scratch (all sized for 576 spectral lines)
 
@@ -29,9 +35,16 @@ final class Quantizer {
     private var cbrtDoubleScratch: ContiguousArray<Double>
     private var decodedDoubleScratch: ContiguousArray<Double>
     private var diffDoubleScratch: ContiguousArray<Double>
+    private var distortionScratch: ContiguousArray<Float>
+    /// Per-(window, band) energy scratch for short blocks (3 windows × 12 short bands).
+    private var shortBandEnergyScratch: ContiguousArray<Double>
+    /// Per-bitstream-slot scratch for the subblock-gain pre-scaled spectral.
+    private var shortPreScaledScratch: ContiguousArray<Float>
 
     init(sampleRate: Int) {
         scaleFactorBandBounds = MP3Constants.scaleFactorBandBoundaries(sampleRate: sampleRate)
+        shortWindowTable = ShortBlockLayout.bitstreamWindowTable(sampleRate: sampleRate)
+        shortBandTable = ShortBlockLayout.bitstreamBandTable(sampleRate: sampleRate)
         absoluteBuffer = ContiguousArray(repeating: 0, count: 576)
         sqrtBuffer = ContiguousArray(repeating: 0, count: 576)
         scaledBuffer = ContiguousArray(repeating: 0, count: 576)
@@ -43,6 +56,9 @@ final class Quantizer {
         cbrtDoubleScratch = ContiguousArray(repeating: 0, count: 576)
         decodedDoubleScratch = ContiguousArray(repeating: 0, count: 576)
         diffDoubleScratch = ContiguousArray(repeating: 0, count: 576)
+        distortionScratch = ContiguousArray(repeating: 0, count: max(1, scaleFactorBandBounds.count - 1))
+        shortBandEnergyScratch = ContiguousArray(repeating: 0, count: 3 * 13)
+        shortPreScaledScratch = ContiguousArray(repeating: 0, count: 576)
     }
 
     // MARK: - Vectorized quantize
@@ -184,14 +200,55 @@ final class Quantizer {
 
     // MARK: - Rate control
 
+    /// Maximum amount the chosen `global_gain` is allowed to drop below the caller's
+    /// hint. When the previous granule on this channel ran at gain G and the current
+    /// granule's optimum is < G - this, we clamp upward to G - this. The cost is a
+    /// few wasted bits on quieter granules; the win is a steady noise floor across
+    /// frames, which removes the audible "fluttering" texture on smooth content.
+    /// 4 ≈ 1 dB step in the decoder's gain-domain unit, well below audibility.
+    private static let gainSmoothingMaxDelta = 4
+
     /// Inner loop: binary-search the minimum global_gain that fits within `targetBits`.
-    func innerLoop(spectral: UnsafeBufferPointer<Float>, targetBits: Int, granuleInfo: inout GranuleInfo) -> [Int] {
+    /// Writes the winning gain's quantized values into `destination` and returns the Huffman
+    /// bit count measured during the winning iteration, so callers never need to re-count.
+    ///
+    /// If `granuleInfo.globalGain` is non-zero on entry it's treated as a smoothing
+    /// hint: the binary search warm-starts at the hint (faster convergence) and the
+    /// chosen gain is clamped upward to no less than `hint - gainSmoothingMaxDelta`
+    /// when the optimum sits below it. Pass 0 to opt out (full [0,255] search, no
+    /// smoothing) — this is what the encoder does on the first granule and after
+    /// any short/start/stop block.
+    private func innerLoop(
+        spectral: UnsafeBufferPointer<Float>,
+        targetBits: Int,
+        destination: UnsafeMutableBufferPointer<Int>,
+        granuleInfo: inout GranuleInfo
+    ) -> Int {
+        let hint = granuleInfo.globalGain
         var lowerGain = 0
         var upperGain = 255
         var bestGain = 255
+        var bestBits = 0
         var bestGranuleInfo = granuleInfo
 
         quantizedScratch.withUnsafeMutableBufferPointer { quantizedBuffer in
+            // Warm-start: try the hint first, then narrow the search around it.
+            // For consecutive long blocks on the same channel this typically converges
+            // in 2–3 iterations instead of the full ~8.
+            if hint > 0, hint < 256 {
+                var hintCandidateInfo = granuleInfo
+                quantizeInto(spectral: spectral.baseAddress!, globalGain: hint, destination: quantizedBuffer.baseAddress!)
+                let hintBits = countBits(quantized: UnsafeBufferPointer(quantizedBuffer), granuleInfo: &hintCandidateInfo)
+                if hintBits <= targetBits {
+                    bestGain = hint
+                    bestBits = hintBits
+                    bestGranuleInfo = hintCandidateInfo
+                    upperGain = hint - 1
+                } else {
+                    lowerGain = hint + 1
+                }
+            }
+
             while lowerGain <= upperGain {
                 let midGain = (lowerGain + upperGain) / 2
                 var candidateInfo = granuleInfo
@@ -200,6 +257,7 @@ final class Quantizer {
 
                 if bits <= targetBits {
                     bestGain = midGain
+                    bestBits = bits
                     bestGranuleInfo = candidateInfo
                     upperGain = midGain - 1
                 } else {
@@ -207,71 +265,246 @@ final class Quantizer {
                 }
             }
 
-            // Recompute the quantized values at bestGain (quantizedBuffer may currently hold the
-            // last-tried gain's output rather than bestGain's output).
-            quantizeInto(spectral: spectral.baseAddress!, globalGain: bestGain, destination: quantizedBuffer.baseAddress!)
+            // Smoothing clamp: when the optimum dropped well below the hint, raise it
+            // back toward the hint by at most `gainSmoothingMaxDelta`. We re-quantize at
+            // the smoothed gain and re-count bits so part2_3_length stays accurate. The
+            // smoothed gain is always ≥ bestGain (= fewer bits used), so the bit budget
+            // stays satisfied for free.
+            if hint > 0, bestGain < hint - Self.gainSmoothingMaxDelta {
+                let smoothedGain = min(255, hint - Self.gainSmoothingMaxDelta)
+                var candidateInfo = granuleInfo
+                quantizeInto(spectral: spectral.baseAddress!, globalGain: smoothedGain, destination: quantizedBuffer.baseAddress!)
+                let smoothedBits = countBits(quantized: UnsafeBufferPointer(quantizedBuffer), granuleInfo: &candidateInfo)
+                if smoothedBits <= targetBits {
+                    bestGain = smoothedGain
+                    bestBits = smoothedBits
+                    bestGranuleInfo = candidateInfo
+                }
+            }
         }
+
+        // Produce bestGain's quantized values directly into the caller's buffer.
+        quantizeInto(spectral: spectral.baseAddress!, globalGain: bestGain, destination: destination.baseAddress!)
 
         granuleInfo = bestGranuleInfo
         granuleInfo.globalGain = bestGain
-        return Array(quantizedScratch)
+        return bestBits
     }
 
     /// Quantize against the normal target first, then spend reservoir bits only when
-    /// measured distortion still exceeds the psychoacoustic thresholds.
+    /// measured distortion still exceeds the psychoacoustic thresholds. Writes the final
+    /// quantized values into `destination` and returns the Huffman bit count (excluding
+    /// `granuleInfo.part2Length`).
     func outerLoop(
-        spectral: [Float],
+        spectral: UnsafeBufferPointer<Float>,
         thresholds: [Float],
         targetBits: Int,
         reservoirBits: Int = 0,
+        destination: UnsafeMutableBufferPointer<Int>,
         granuleInfo: inout GranuleInfo
-    ) -> [Int] {
-        var baseInfo = granuleInfo
-        let baseQuantized = quantizeWithDistortionControl(
-            spectral: spectral,
-            thresholds: thresholds,
-            targetBits: targetBits,
-            granuleInfo: &baseInfo
-        )
+    ) -> Int {
+        // First-cut short-block path: skip the long-block distortion-control loop and
+        // let global_gain alone handle quantization. All short scale factors and
+        // subblock_gains stay at zero, so part2Length = 0 and every available bit
+        // goes to Huffman data. This is correct but suboptimal — per-(window, band)
+        // scale factor optimization can be layered in later without changing callers.
+        if granuleInfo.blockType == MDCTBlockType.shortBlocks.rawValue {
+            return outerLoopShort(
+                spectral: spectral,
+                targetBits: targetBits + reservoirBits,
+                destination: destination,
+                granuleInfo: &granuleInfo
+            )
+        }
+
+        let originalInfo = granuleInfo
+        var workingInfo = granuleInfo
+        let baseBits = distortionScratch.withUnsafeMutableBufferPointer { distortion in
+            quantizeWithDistortionControl(
+                spectral: spectral,
+                thresholds: thresholds,
+                targetBits: targetBits,
+                destination: destination,
+                distortion: distortion,
+                granuleInfo: &workingInfo
+            )
+        }
 
         guard reservoirBits > 0 else {
-            granuleInfo = baseInfo
-            return baseQuantized
+            granuleInfo = workingInfo
+            return baseBits
         }
 
-        let pressure = maskingPressure(
-            spectral: spectral,
-            quantized: baseQuantized,
-            granuleInfo: baseInfo,
-            thresholds: thresholds
-        )
+        let pressure = distortionScratch.withUnsafeBufferPointer { distortion in
+            maskingPressure(distortion: distortion, thresholds: thresholds)
+        }
         let extraBits = reservoirBitsToSpend(availableBits: reservoirBits, maskingPressure: pressure)
         guard extraBits > 0 else {
-            granuleInfo = baseInfo
-            return baseQuantized
+            granuleInfo = workingInfo
+            return baseBits
         }
 
-        var reservoirInfo = granuleInfo
-        let reservoirQuantized = quantizeWithDistortionControl(
-            spectral: spectral,
-            thresholds: thresholds,
-            targetBits: targetBits + extraBits,
-            granuleInfo: &reservoirInfo
-        )
+        // If the base pass converged without bumping any scale factors, the reservoir
+        // pass with a larger budget would only produce smaller quantized values and even
+        // less distortion — running the full three-iteration distortion-control loop again
+        // is guaranteed not to bump either, so a single innerLoop at the larger budget
+        // suffices. That cuts the most expensive call path (countBits + Huffman scans
+        // through the binary search) roughly in half for well-masked audio.
+        if workingInfo.scaleFactors.allSatisfy({ $0 == 0 }) {
+            var reservoirInfo = originalInfo
+            reservoirInfo.scaleFactors = [Int](repeating: 0, count: scaleFactorBandBounds.count - 1)
+            reservoirInfo.scaleFactorScale = false
+            reservoirInfo.scaleFactorCompress = 0
+            reservoirInfo.part2Length = 0
+            let availableBits = max(0, targetBits + extraBits - reservoirInfo.part2Length)
+            let reservoirHuffmanBits = innerLoop(
+                spectral: spectral,
+                targetBits: availableBits,
+                destination: destination,
+                granuleInfo: &reservoirInfo
+            )
+            granuleInfo = reservoirInfo
+            return reservoirHuffmanBits
+        }
+
+        var reservoirInfo = originalInfo
+        let reservoirHuffmanBits = distortionScratch.withUnsafeMutableBufferPointer { distortion in
+            quantizeWithDistortionControl(
+                spectral: spectral,
+                thresholds: thresholds,
+                targetBits: targetBits + extraBits,
+                destination: destination,
+                distortion: distortion,
+                granuleInfo: &reservoirInfo
+            )
+        }
         granuleInfo = reservoirInfo
-        return reservoirQuantized
+        return reservoirHuffmanBits
+    }
+
+    /// Short-block fast path: pick a `subblock_gain` per window so all three windows
+    /// share the bit budget instead of the loud window starving the quiet ones, then
+    /// run the inner-loop binary search on `global_gain`. Scale factors stay at zero
+    /// for now; per-(window, band) scale factor optimization can layer on top.
+    private func outerLoopShort(
+        spectral: UnsafeBufferPointer<Float>,
+        targetBits: Int,
+        destination: UnsafeMutableBufferPointer<Int>,
+        granuleInfo: inout GranuleInfo
+    ) -> Int {
+        var subblockGain: [Int] = [0, 0, 0]
+
+        // Scan once for per-window peak magnitude.
+        var windowPeak: [Double] = [0, 0, 0]
+        shortWindowTable.withUnsafeBufferPointer { windowIndices in
+            let windowBase = windowIndices.baseAddress!
+            for index in 0 ..< 576 {
+                let value = abs(Double(spectral[index]))
+                let window = windowBase[index]
+                if value > windowPeak[window] {
+                    windowPeak[window] = value
+                }
+            }
+        }
+        let maxPeak = max(windowPeak[0], max(windowPeak[1], windowPeak[2]))
+
+        // subblock_gain attenuates the decoder by 2^(-2*sg) per window, so the encoder
+        // pre-multiplies by 2^(2*sg). For a window that's quieter than the loudest by
+        // a factor R, choose sg = floor(log2(R) / 2) — the largest power-of-4 boost
+        // that doesn't exceed the loud window's peak. Without this, a single-window
+        // transient leaves the other windows quantized to all zeros (audible spectral
+        // holes); with it, every window keeps real resolution.
+        if maxPeak > 0 {
+            for windowIndex in 0 ..< 3 {
+                let peak = windowPeak[windowIndex]
+                guard peak > 0 else {
+                    continue
+                }
+                let ratio = maxPeak / peak
+                if ratio <= 1 {
+                    continue
+                }
+                let candidate = Int(floor(log2(ratio) / 2.0))
+                subblockGain[windowIndex] = max(0, min(7, candidate))
+            }
+        }
+
+        // Pre-scale spectral by 2^(2*sg) per window into the dedicated scratch.
+        return shortPreScaledScratch.withUnsafeMutableBufferPointer { preScaled in
+            shortWindowTable.withUnsafeBufferPointer { windowIndices in
+                let windowBase = windowIndices.baseAddress!
+                let factors = (0 ..< 3).map { Float(pow(2.0, Double(2 * subblockGain[$0]))) }
+                for index in 0 ..< 576 {
+                    preScaled[index] = spectral[index] * factors[windowBase[index]]
+                }
+            }
+
+            granuleInfo.scaleFactors = Array(repeating: 0, count: scaleFactorBandBounds.count - 1)
+            granuleInfo.scaleFactorsShort = Array(repeating: 0, count: 39)
+            granuleInfo.scaleFactorScale = false
+            granuleInfo.scaleFactorCompress = 0
+            granuleInfo.part2Length = 0
+            granuleInfo.preflag = false
+            granuleInfo.subblockGain = subblockGain
+
+            return innerLoop(
+                spectral: UnsafeBufferPointer(preScaled),
+                targetBits: max(0, targetBits),
+                destination: destination,
+                granuleInfo: &granuleInfo
+            )
+        }
     }
 
     /// ISO/IEC 11172-3 distortion-control loop. Each iteration quantizes at the current
     /// scale factors, measures actual per-band distortion against the psychoacoustic
     /// masking threshold, and amplifies only the bands whose noise still exceeds it.
     /// The loop converges when every band is masked or hit its per-region cap.
+    ///
+    /// Writes the final quantized values into `destination` (one write per iteration,
+    /// last iteration wins), leaves the matching per-band distortion in `distortion`
+    /// so the caller can reuse it for masking-pressure checks without a second
+    /// cbrt/requantize pass, and returns the Huffman bit count.
     private func quantizeWithDistortionControl(
-        spectral: [Float],
+        spectral: UnsafeBufferPointer<Float>,
         thresholds: [Float],
         targetBits: Int,
+        destination: UnsafeMutableBufferPointer<Int>,
+        distortion: UnsafeMutableBufferPointer<Float>,
         granuleInfo: inout GranuleInfo
-    ) -> [Int] {
+    ) -> Int {
+        // Always scale=0 (0.5 dB SF step) for now. A scale=1 retry could help on
+        // genuinely cap-limited granules but the all-or-nothing rerun roughly
+        // doubles encode time on real-world music, so we leave it for a future
+        // pass with a cheaper retry strategy (see TODO.md).
+        distortionControlPass(
+            spectral: spectral,
+            thresholds: thresholds,
+            targetBits: targetBits,
+            scaleFactorScale: false,
+            destination: destination,
+            distortion: distortion,
+            granuleInfo: &granuleInfo
+        ).huffmanBits
+    }
+
+    private struct DistortionControlResult {
+        var huffmanBits: Int
+        var cappedBandStillAudible: Bool
+    }
+
+    /// One full distortion-control pass at a fixed `scaleFactorScale`. Returns the
+    /// Huffman bit count plus a flag indicating whether any band ended capped with
+    /// residual distortion (a future scale=1 retry hint that's not currently used).
+    private func distortionControlPass(
+        spectral: UnsafeBufferPointer<Float>,
+        thresholds: [Float],
+        targetBits: Int,
+        scaleFactorScale: Bool,
+        destination: UnsafeMutableBufferPointer<Int>,
+        distortion: UnsafeMutableBufferPointer<Float>,
+        granuleInfo: inout GranuleInfo
+    ) -> DistortionControlResult {
         let bandCount = scaleFactorBandBounds.count - 1
         // SFBs 11–20 span many spectral lines, so each SF unit there costs lots of
         // Huffman bits; cap them tighter than the narrow low SFBs.
@@ -283,54 +516,56 @@ final class Quantizer {
         let bumpMargin: Float = 2.0
 
         var scaleFactors = [Int](repeating: 0, count: bandCount)
-        var resultQuantized: [Int] = []
         var resultInfo = granuleInfo
+        var resultBits = 0
 
         for iteration in 0 ..< maxIterations {
             var workingInfo = granuleInfo
             workingInfo.scaleFactors = scaleFactors
-            workingInfo.scaleFactorScale = false
+            workingInfo.scaleFactorScale = scaleFactorScale
             workingInfo.scaleFactorCompress = chooseScaleFactorCompress(for: scaleFactors) ?? 0
             workingInfo.part2Length = scaleFactorBitCost(compress: workingInfo.scaleFactorCompress)
 
             let availableBits = max(0, targetBits - workingInfo.part2Length)
 
-            let quantized: [Int]
-            if scaleFactors.allSatisfy({ $0 == 0 }) {
-                quantized = spectral.withUnsafeBufferPointer { spectralBuffer in
-                    innerLoop(spectral: spectralBuffer, targetBits: availableBits, granuleInfo: &workingInfo)
-                }
+            let huffmanBits: Int = if scaleFactors.allSatisfy({ $0 == 0 }) {
+                innerLoop(
+                    spectral: spectral,
+                    targetBits: availableBits,
+                    destination: destination,
+                    granuleInfo: &workingInfo
+                )
             } else {
-                quantized = spectral.withUnsafeBufferPointer { spectralBuffer in
-                    scaleFactorScratch.withUnsafeMutableBufferPointer { scaledBuffer in
-                        applyScaleFactors(
-                            spectral: spectralBuffer,
-                            scaleFactors: scaleFactors,
-                            scaleFactorScale: workingInfo.scaleFactorScale,
-                            destination: scaledBuffer
-                        )
-                        return innerLoop(
-                            spectral: UnsafeBufferPointer(start: scaledBuffer.baseAddress!, count: spectralBuffer.count),
-                            targetBits: availableBits,
-                            granuleInfo: &workingInfo
-                        )
-                    }
+                scaleFactorScratch.withUnsafeMutableBufferPointer { scaledBuffer in
+                    applyScaleFactors(
+                        spectral: spectral,
+                        scaleFactors: scaleFactors,
+                        scaleFactorScale: workingInfo.scaleFactorScale,
+                        destination: scaledBuffer
+                    )
+                    return innerLoop(
+                        spectral: UnsafeBufferPointer(start: scaledBuffer.baseAddress!, count: spectral.count),
+                        targetBits: availableBits,
+                        destination: destination,
+                        granuleInfo: &workingInfo
+                    )
                 }
             }
-            resultQuantized = quantized
             resultInfo = workingInfo
+            resultBits = huffmanBits
+
+            perBandDistortion(
+                originalSpectral: spectral,
+                quantized: UnsafeBufferPointer(destination),
+                globalGain: workingInfo.globalGain,
+                scaleFactors: scaleFactors,
+                scaleFactorScale: workingInfo.scaleFactorScale,
+                distortion: distortion
+            )
 
             if iteration == maxIterations - 1 {
                 break
             }
-
-            let distortion = perBandDistortion(
-                originalSpectral: spectral,
-                quantized: quantized,
-                globalGain: workingInfo.globalGain,
-                scaleFactors: scaleFactors,
-                scaleFactorScale: workingInfo.scaleFactorScale
-            )
 
             var anyBumped = false
             for band in 0 ..< bandCount {
@@ -353,24 +588,42 @@ final class Quantizer {
             }
         }
 
+        // Detect whether the granule is a genuine "needs more amplification range"
+        // case worth paying the scale=1 retry cost for. We require ≥ 6 bands capped
+        // with residual distortion ≥ 8× threshold (≈ 9 dB above masking) — i.e.
+        // the granule is broadly distortion-limited at the SF cap, not just
+        // marginal in a few places. Looser thresholds here easily double encoder
+        // runtime for negligible quality gain because most music produces a few
+        // capped bands as a matter of course.
+        let retryBandThreshold = 6
+        let retryDistortionMargin: Float = bumpMargin * 4
+        var cappedAudibleBands = 0
+        for band in 0 ..< bandCount {
+            let cap = band < 11 ? lowBandCap : highBandCap
+            guard scaleFactors[band] >= cap else {
+                continue
+            }
+            let threshold = band < thresholds.count ? thresholds[band] : 0
+            guard threshold > 0 else {
+                continue
+            }
+            if distortion[band] > threshold * retryDistortionMargin {
+                cappedAudibleBands += 1
+                if cappedAudibleBands >= retryBandThreshold {
+                    break
+                }
+            }
+        }
+        let cappedBandStillAudible = cappedAudibleBands >= retryBandThreshold
+
         granuleInfo = resultInfo
-        return resultQuantized
+        return DistortionControlResult(huffmanBits: resultBits, cappedBandStillAudible: cappedBandStillAudible)
     }
 
     private func maskingPressure(
-        spectral: [Float],
-        quantized: [Int],
-        granuleInfo: GranuleInfo,
+        distortion: UnsafeBufferPointer<Float>,
         thresholds: [Float]
     ) -> Float {
-        let distortion = perBandDistortion(
-            originalSpectral: spectral,
-            quantized: quantized,
-            globalGain: granuleInfo.globalGain,
-            scaleFactors: granuleInfo.scaleFactors,
-            scaleFactorScale: granuleInfo.scaleFactorScale
-        )
-
         var pressure: Float = 0
         for band in 0 ..< min(distortion.count, thresholds.count) {
             let threshold = thresholds[band]
@@ -400,25 +653,26 @@ final class Quantizer {
     /// Compares against the unscaled original, so distortion is in the audio (post-decode) domain
     /// and directly comparable to a band masking threshold expressed in the same units.
     private func perBandDistortion(
-        originalSpectral: [Float],
-        quantized: [Int],
+        originalSpectral: UnsafeBufferPointer<Float>,
+        quantized: UnsafeBufferPointer<Int>,
         globalGain: Int,
         scaleFactors: [Int],
-        scaleFactorScale: Bool
-    ) -> [Float] {
+        scaleFactorScale: Bool,
+        distortion: UnsafeMutableBufferPointer<Float>
+    ) {
         let bandCount = scaleFactorBandBounds.count - 1
-        var distortion = [Float](repeating: 0, count: bandCount)
+        for band in 0 ..< min(bandCount, distortion.count) {
+            distortion[band] = 0
+        }
 
         let sampleCount = min(576, originalSpectral.count, quantized.count)
         guard sampleCount > 0 else {
-            return distortion
+            return
         }
 
         var sampleCountInt32 = Int32(sampleCount)
-        originalSpectral.withUnsafeBufferPointer { originalBuffer in
-            originalDoubleScratch.withUnsafeMutableBufferPointer { originalDouble in
-                vDSP_vspdp(originalBuffer.baseAddress!, 1, originalDouble.baseAddress!, 1, vDSP_Length(sampleCount))
-            }
+        originalDoubleScratch.withUnsafeMutableBufferPointer { originalDouble in
+            vDSP_vspdp(originalSpectral.baseAddress!, 1, originalDouble.baseAddress!, 1, vDSP_Length(sampleCount))
         }
 
         quantizedMagnitudeDoubleScratch.withUnsafeMutableBufferPointer { magnitudes in
@@ -426,8 +680,7 @@ final class Quantizer {
                 let magnitudeBase = magnitudes.baseAddress!
                 let decodedBase = decoded.baseAddress!
                 for index in 0 ..< sampleCount {
-                    let value = quantized[index]
-                    magnitudeBase[index] = Double(abs(value))
+                    magnitudeBase[index] = Double(abs(quantized[index]))
                 }
 
                 cbrtDoubleScratch.withUnsafeMutableBufferPointer { roots in
@@ -469,8 +722,6 @@ final class Quantizer {
                 }
             }
         }
-
-        return distortion
     }
 
     private func applyScaleFactors(

@@ -275,6 +275,308 @@ func `unsupported sample rate`() {
     }
 }
 
+@Test
+func `tonality tightens threshold vs noise at equal energy`() {
+    // Build two spectral arrays with the same total energy in the same band:
+    // one with all of it in a single bin (pure tone), one spread evenly
+    // (white noise). The tonal version should produce a noticeably tighter
+    // threshold for that band — that's the whole point of the SFM-driven SNR
+    // boost.
+    let model = PsychoacousticModel(sampleRate: 44100)
+    let bandIndex = 8 // mid-band, well-defined boundaries
+    let bounds = model.scaleFactorBandBounds
+    let bandStart = bounds[bandIndex]
+    let bandEnd = bounds[bandIndex + 1]
+    let bandWidth = bandEnd - bandStart
+    let bandEnergy: Float = 1.0 // arbitrary, only ratios matter
+
+    var tonalSpectral = [Float](repeating: 0, count: 576)
+    tonalSpectral[bandStart] = sqrt(bandEnergy)
+
+    var noiseSpectral = [Float](repeating: 0, count: 576)
+    let perLineMagnitude = sqrt(bandEnergy / Float(bandWidth))
+    for index in bandStart ..< bandEnd {
+        noiseSpectral[index] = perLineMagnitude
+    }
+
+    let tonalThresholds = tonalSpectral.withUnsafeBufferPointer { buffer in
+        model.computeThresholds(spectral: buffer)
+    }
+    let noiseThresholds = noiseSpectral.withUnsafeBufferPointer { buffer in
+        model.computeThresholds(spectral: buffer)
+    }
+
+    #expect(
+        tonalThresholds[bandIndex] < noiseThresholds[bandIndex],
+        "Tonal band should get a tighter (smaller) threshold than equal-energy noise"
+    )
+    // Boost should be substantial — at least 6 dB tighter (factor of 4 in energy
+    // domain) even after the spreading function smears things slightly.
+    let ratio = Double(noiseThresholds[bandIndex] / tonalThresholds[bandIndex])
+    #expect(ratio > 4.0, "Tonal threshold should be at least ~6 dB tighter than noise; got ratio \(ratio)")
+}
+
+@Test
+func `correlated stereo selects mid-side coding`() throws {
+    let sampleRate = 44100
+    let channels = 2
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: channels, bitrate: 128)
+
+    // L = R (perfect correlation): the side channel after the M/S transform is
+    // identically zero, so the encoder should emit jointStereo + mode_extension
+    // 0b10 (M/S on) for every frame.
+    let stereoFrameCount = sampleRate
+    var pcm = [Float](repeating: 0, count: stereoFrameCount * channels)
+    for frameIndex in 0 ..< stereoFrameCount {
+        let value = Float(sin(2.0 * Double.pi * 440.0 * Double(frameIndex) / Double(sampleRate))) * 0.5
+        pcm[frameIndex * 2] = value
+        pcm[frameIndex * 2 + 1] = value
+    }
+
+    var encoded = encoder.encode(pcm: pcm)
+    encoded.append(encoder.flush())
+
+    let frames = try parseMP3Frames(encoded)
+    #expect(!frames.isEmpty)
+    let allJointStereo = frames.allSatisfy { $0.channelMode == .jointStereo }
+    let allMSExtension = frames.allSatisfy { $0.modeExtension & 0b10 != 0 }
+    #expect(allJointStereo, "Identical L=R input should be encoded with jointStereo mode")
+    #expect(allMSExtension, "M/S bit (0b10) should be set in mode_extension for correlated stereo")
+
+    // Sanity: round-trip back to L=R audio.
+    let decoded = try MP3Decoder().decode(encoded)
+    #expect(decoded.channels == channels)
+    let allFinite = decoded.samples.allSatisfy(\.isFinite)
+    #expect(allFinite)
+}
+
+@Test
+func `uncorrelated stereo stays in L slash R`() throws {
+    let sampleRate = 44100
+    let channels = 2
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: channels, bitrate: 128)
+
+    // L = sine(440 Hz), R = sine(523 Hz, slightly out of phase): the two
+    // channels are nearly orthogonal, so M and S have similar energy and the
+    // encoder should fall back to plain stereo (mode 0, mode_extension 0).
+    let stereoFrameCount = sampleRate
+    var pcm = [Float](repeating: 0, count: stereoFrameCount * channels)
+    for frameIndex in 0 ..< stereoFrameCount {
+        let leftValue = Float(sin(2.0 * Double.pi * 440.0 * Double(frameIndex) / Double(sampleRate))) * 0.5
+        let rightValue = Float(cos(2.0 * Double.pi * 523.0 * Double(frameIndex) / Double(sampleRate))) * 0.5
+        pcm[frameIndex * 2] = leftValue
+        pcm[frameIndex * 2 + 1] = rightValue
+    }
+
+    var encoded = encoder.encode(pcm: pcm)
+    encoded.append(encoder.flush())
+
+    let frames = try parseMP3Frames(encoded)
+    #expect(!frames.isEmpty)
+    let anyPlainStereo = frames.contains { $0.channelMode == .stereo }
+    #expect(
+        anyPlainStereo,
+        "Uncorrelated L/R should produce at least some plain-stereo frames (mode 0)"
+    )
+}
+
+@Test
+func `mid-side stereo round trips`() throws {
+    let sampleRate = 44100
+    let channels = 2
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: channels, bitrate: 128)
+
+    // L and R highly correlated but not identical (L slightly louder, R slightly
+    // delayed): exercises the full M/S forward+inverse path through the codec.
+    let stereoFrameCount = sampleRate
+    var pcm = [Float](repeating: 0, count: stereoFrameCount * channels)
+    for frameIndex in 0 ..< stereoFrameCount {
+        let leftValue = Float(sin(2.0 * Double.pi * 440.0 * Double(frameIndex) / Double(sampleRate))) * 0.5
+        let rightValue = Float(sin(2.0 * Double.pi * 440.0 * Double(frameIndex - 1) / Double(sampleRate))) * 0.45
+        pcm[frameIndex * 2] = leftValue
+        pcm[frameIndex * 2 + 1] = rightValue
+    }
+
+    var encoded = encoder.encode(pcm: pcm)
+    encoded.append(encoder.flush())
+
+    let decoded = try MP3Decoder().decode(encoded)
+    #expect(decoded.channels == channels)
+    #expect(decoded.samples.count >= pcm.count - 4096)
+
+    // Compare each channel's RMS against the source RMS — the round-trip
+    // shouldn't drift by more than the encoder's normal compression headroom.
+    var leftReferenceEnergy = 0.0
+    var rightReferenceEnergy = 0.0
+    let referenceCount = min(pcm.count / 2, decoded.samples.count / 2)
+    for index in 0 ..< referenceCount {
+        let leftValue = Double(pcm[index * 2])
+        let rightValue = Double(pcm[index * 2 + 1])
+        leftReferenceEnergy += leftValue * leftValue
+        rightReferenceEnergy += rightValue * rightValue
+    }
+    var leftDecodedEnergy = 0.0
+    var rightDecodedEnergy = 0.0
+    for index in 0 ..< referenceCount {
+        let leftValue = Double(decoded.samples[index * 2])
+        let rightValue = Double(decoded.samples[index * 2 + 1])
+        leftDecodedEnergy += leftValue * leftValue
+        rightDecodedEnergy += rightValue * rightValue
+    }
+    let leftRatio = leftDecodedEnergy / max(leftReferenceEnergy, 1e-12)
+    let rightRatio = rightDecodedEnergy / max(rightReferenceEnergy, 1e-12)
+    #expect(leftRatio > 0.25 && leftRatio < 4.0, "Left channel energy should round-trip in range, got \(leftRatio)")
+    #expect(rightRatio > 0.25 && rightRatio < 4.0, "Right channel energy should round-trip in range, got \(rightRatio)")
+}
+
+@Test
+func `transient triggers short block switching`() throws {
+    let sampleRate = 44100
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
+
+    // 0.6 s of silence, sharp 1.0 amplitude impulse burst (40 ms), 0.6 s of silence.
+    // The impulse plus a bit of decay is what drives the transient detector
+    // and forces a short-block group.
+    let prePadSamples = sampleRate * 6 / 10
+    let burstSamples = sampleRate * 4 / 100
+    let postPadSamples = sampleRate * 6 / 10
+    var pcm = [Float](repeating: 0, count: prePadSamples + burstSamples + postPadSamples)
+    for sampleIndex in 0 ..< burstSamples {
+        let phase = 2.0 * Double.pi * 4000.0 * Double(sampleIndex) / Double(sampleRate)
+        let envelope = exp(-Double(sampleIndex) / Double(burstSamples / 4))
+        pcm[prePadSamples + sampleIndex] = Float(sin(phase) * envelope)
+    }
+
+    var encoded = encoder.encode(pcm: pcm)
+    encoded.append(encoder.flush())
+
+    let frames = try parseMP3Frames(encoded)
+    #expect(!frames.isEmpty)
+    let blockTypeStats = try collectBlockTypeStats(frames: frames, data: encoded)
+
+    #expect(
+        blockTypeStats.shortBlockGranules > 0,
+        "Encoder should emit at least one short-block granule for a transient signal"
+    )
+    #expect(
+        blockTypeStats.startBlockGranules > 0,
+        "Encoder should emit a start block before short blocks to satisfy MDCT overlap"
+    )
+    #expect(
+        blockTypeStats.stopBlockGranules > 0,
+        "Encoder should emit a stop block to transition back to long blocks"
+    )
+
+    // Sanity: the file must still round-trip cleanly through the decoder.
+    let decoded = try MP3Decoder().decode(encoded)
+    #expect(decoded.sampleRate == sampleRate)
+    #expect(decoded.channels == 1)
+    #expect(!decoded.samples.isEmpty)
+    let allFinite = decoded.samples.allSatisfy(\.isFinite)
+    #expect(allFinite)
+}
+
+@Test
+func `single-window impulse exercises subblock_gain`() throws {
+    let sampleRate = 44100
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
+
+    // ~0.5 ms click sitting inside a single short window (a short window is ~8 ms of
+    // audio post-filterbank). With one window much louder than the other two, the
+    // encoder should pick a non-zero subblock_gain on at least one of the quiet
+    // windows to keep them from being quantized to all zeros.
+    let leadInSamples = sampleRate * 5 / 10
+    let burstSamples = 24
+    let trailingSamples = sampleRate * 5 / 10
+    var pcm = [Float](repeating: 0, count: leadInSamples + burstSamples + trailingSamples)
+    for sampleIndex in 0 ..< burstSamples {
+        let phase = 2.0 * Double.pi * 6000.0 * Double(sampleIndex) / Double(sampleRate)
+        pcm[leadInSamples + sampleIndex] = Float(sin(phase))
+    }
+
+    var encoded = encoder.encode(pcm: pcm)
+    encoded.append(encoder.flush())
+
+    let frames = try parseMP3Frames(encoded)
+    let stats = try collectBlockTypeStats(frames: frames, data: encoded)
+    #expect(stats.shortBlockGranules > 0, "Click should still trigger short blocks")
+    let anySubblockGainSet = stats.maxSubblockGain.contains { $0 > 0 }
+    #expect(
+        anySubblockGainSet,
+        "Quiet windows of a single-window click should pick up a non-zero subblock_gain"
+    )
+
+    // The bitstream must still round-trip cleanly.
+    let decoded = try MP3Decoder().decode(encoded)
+    #expect(decoded.sampleRate == sampleRate)
+    let allFinite = decoded.samples.allSatisfy(\.isFinite)
+    #expect(allFinite)
+}
+
+private struct BlockTypeStats {
+    var longGranules = 0
+    var startBlockGranules = 0
+    var shortBlockGranules = 0
+    var stopBlockGranules = 0
+    /// Maximum non-zero subblock_gain seen across any short-block granule, per window.
+    var maxSubblockGain: [Int] = [0, 0, 0]
+}
+
+/// Walk each frame's side info and count the per-(granule, channel) block types.
+/// Mirrors just enough of the MPEG-1 Layer III side-info layout to drive the test.
+private func collectBlockTypeStats(frames: [MP3Frame], data: Data) throws -> BlockTypeStats {
+    var stats = BlockTypeStats()
+    let bytes = [UInt8](data)
+    for frame in frames {
+        let sideInfoStart = frame.offset + 4 + (frame.hasCRC ? 2 : 0)
+        let channels = frame.channelMode == .mono ? 1 : 2
+        // main_data_begin (9) + private (5/3) + scfsi (4 * channels)
+        var bitOffset = (sideInfoStart * 8) + 9 + (channels == 1 ? 5 : 3) + (4 * channels)
+
+        for _ in 0 ..< 2 {
+            for _ in 0 ..< channels {
+                bitOffset += 12 + 9 + 8 + 4 // part2_3_length, big_values, global_gain, scalefac_compress
+                let windowSwitchingFlag = (Int(bytes[bitOffset / 8]) >> (7 - (bitOffset % 8))) & 1
+                bitOffset += 1
+                if windowSwitchingFlag == 1 {
+                    let blockType = readBitsBE(bytes: bytes, bitOffset: bitOffset, count: 2)
+                    bitOffset += 2
+                    bitOffset += 1 // mixed_block_flag
+                    bitOffset += 5 + 5 // table_select[0..1]
+                    for windowIndex in 0 ..< 3 {
+                        let gain = readBitsBE(bytes: bytes, bitOffset: bitOffset, count: 3)
+                        bitOffset += 3
+                        if blockType == 2, gain > stats.maxSubblockGain[windowIndex] {
+                            stats.maxSubblockGain[windowIndex] = gain
+                        }
+                    }
+                    switch blockType {
+                    case 1: stats.startBlockGranules += 1
+                    case 2: stats.shortBlockGranules += 1
+                    case 3: stats.stopBlockGranules += 1
+                    default: break
+                    }
+                } else {
+                    bitOffset += 5 + 5 + 5 + 4 + 3 // table_select × 3, region_count × 2
+                    stats.longGranules += 1
+                }
+                bitOffset += 1 + 1 + 1 // preflag, scalefac_scale, count1table_select
+            }
+        }
+    }
+    return stats
+}
+
+private func readBitsBE(bytes: [UInt8], bitOffset: Int, count: Int) -> Int {
+    var value = 0
+    for index in 0 ..< count {
+        let absoluteBit = bitOffset + index
+        let bit = (Int(bytes[absoluteBit / 8]) >> (7 - (absoluteBit % 8))) & 1
+        value = (value << 1) | bit
+    }
+    return value
+}
+
 // MARK: - Test errors
 
 private enum TestError: Error, Equatable {
@@ -412,6 +714,7 @@ private struct MP3Frame {
     var sampleRate: Int
     var bitrate: Int // kbps
     var channelMode: ChannelMode
+    var modeExtension: Int
     var frameSize: Int // total bytes including header (+ CRC + side info + main data + padding)
     var sideInfoSize: Int // bytes of side info (for MPEG-1: 17 mono, 32 stereo)
     var hasCRC: Bool
@@ -513,6 +816,7 @@ private func parseFrameHeader(bytes: [UInt8], offset: Int) throws -> MP3Frame {
     default:
         .mono
     }
+    let modeExtension = Int((modeByte >> 4) & 0x03)
 
     let frameSize = (144 * bitrate * 1000) / sampleRate + padding
     let sideInfoSize = channelMode == .mono ? 17 : 32
@@ -530,6 +834,7 @@ private func parseFrameHeader(bytes: [UInt8], offset: Int) throws -> MP3Frame {
         sampleRate: sampleRate,
         bitrate: bitrate,
         channelMode: channelMode,
+        modeExtension: modeExtension,
         frameSize: frameSize,
         sideInfoSize: sideInfoSize,
         hasCRC: hasCRC,

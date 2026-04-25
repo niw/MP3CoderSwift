@@ -75,7 +75,7 @@ public final class MP3Decoder {
         var streamSampleRate: Int?
         var streamChannels: Int?
 
-        try data.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) -> Void in
+        try data.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) in
             guard let basePointer = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return
             }

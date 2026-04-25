@@ -97,6 +97,7 @@ struct GranuleInfo {
     var scaleFactorScale: Bool = false
     var count1TableSelect: Int = 0 // 0 or 1 (table A or B)
     var scaleFactors: [Int] = Array(repeating: 0, count: 22) // long block scale factors
+    var scaleFactorsShort: [Int] = Array(repeating: 0, count: 39) // short block scale factors, indexed [window * 13 + band]
     var part2Length: Int = 0 // bits for scale factors
 }
 
