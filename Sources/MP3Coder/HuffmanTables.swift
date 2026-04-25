@@ -708,12 +708,12 @@ func huffmanDecodePair(reader: BitstreamReader, tableIndex: Int) throws -> (firs
     }
 
     // First-level lookup: peek peekBits, index into the prefix table.
-    let peekedBits = try reader.peekBits(decodeTable.peekBits)
+    let peekedBits = try reader.peekBitsPadded(decodeTable.peekBits)
     let entry = decodeTable.lookup[peekedBits]
 
     var baseFirst: Int
     var baseSecond: Int
-    if entry.baseLen != 0 {
+    if entry.baseLen != 0, reader.bitsRemaining >= Int(entry.baseLen) {
         baseFirst = Int(entry.baseX)
         baseSecond = Int(entry.baseY)
         reader.consumeBits(Int(entry.baseLen))
@@ -795,9 +795,9 @@ func huffmanEncodeQuad(first: Int, second: Int, third: Int, fourth: Int, tableIn
 
 func huffmanDecodeQuad(reader: BitstreamReader, tableIndex: Int) throws -> (first: Int, second: Int, third: Int, fourth: Int) {
     let lookup = quadDecodeTables[tableIndex == 0 ? 0 : 1]
-    let peekedBits = try reader.peekBits(10)
+    let peekedBits = try reader.peekBitsPadded(10)
     let entry = lookup[peekedBits]
-    guard entry.baseLen != 0 else {
+    guard entry.baseLen != 0, reader.bitsRemaining >= Int(entry.baseLen) else {
         throw MP3DecoderError.invalidBitstream("Invalid Huffman count1 code")
     }
     reader.consumeBits(Int(entry.baseLen))
@@ -967,16 +967,6 @@ func countHuffmanBits3(
     return (totalFirst, totalSecond, totalThird)
 }
 
-func selectHuffmanTable(values: UnsafeBufferPointer<Int>, start: Int, end: Int) -> Int {
-    selectHuffmanTableAndBits(values: values, start: start, end: end).tableIndex
-}
-
-func selectHuffmanTable(values: [Int], start: Int, end: Int) -> Int {
-    values.withUnsafeBufferPointer { buffer in
-        selectHuffmanTable(values: buffer, start: start, end: end)
-    }
-}
-
 /// Count the number of bits the pair (firstValue, secondValue) would take with the given table.
 /// Returns `huffmanOverflowBits` if the pair cannot be encoded.
 /// This is the hot path for the rate-control binary search: ~5× faster than
@@ -1041,12 +1031,6 @@ func countHuffmanBits(values: UnsafeBufferPointer<Int>, start: Int, end: Int, ta
         pairIndex += 2
     }
     return total
-}
-
-func countHuffmanBits(values: [Int], start: Int, end: Int, tableIndex: Int) -> Int {
-    values.withUnsafeBufferPointer { buffer in
-        countHuffmanBits(values: buffer, start: start, end: end, tableIndex: tableIndex)
-    }
 }
 
 @inline(__always)

@@ -69,6 +69,45 @@ func `encode stereo sine wave produces structurally valid MP3`() throws {
 }
 
 @Test
+func `encoder uses bit reservoir when frames have spare main data`() throws {
+    let sampleRate = 44100
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
+
+    let sampleCount = sampleRate
+    var pcmSamples = [Float](repeating: 0, count: sampleCount)
+    for sampleIndex in 0 ..< sampleCount {
+        pcmSamples[sampleIndex] = Float(sin(2.0 * Double.pi * 440.0 * Double(sampleIndex) / Double(sampleRate))) * 0.5
+    }
+
+    var output = encoder.encode(pcm: pcmSamples)
+    output.append(encoder.flush())
+
+    let frames = try parseMP3Frames(output)
+    #expect(frames.dropFirst().contains { $0.mainDataBegin > 0 }, "Encoder should carry main data through the reservoir")
+    try assertMainDataReservoirIsConsistent(frames: frames)
+}
+
+@Test
+func `huffman count1 decode accepts final short code at end of buffer`() throws {
+    let (code, bits) = huffmanEncodeQuad(first: 0, second: 0, third: 0, fourth: 0, tableIndex: 0)
+    #expect(bits < 10, "Regression setup should exercise padded count1 lookup")
+
+    let writer = BitstreamWriter()
+    writer.writeBits(code, count: bits)
+    let encoded = writer.toData()
+
+    try encoded.withUnsafeBytes { rawBuffer in
+        let reader = BitstreamReader(bytes: rawBuffer.bindMemory(to: UInt8.self).baseAddress!, count: encoded.count)
+        let quad = try huffmanDecodeQuad(reader: reader, tableIndex: 0)
+        #expect(quad.first == 0)
+        #expect(quad.second == 0)
+        #expect(quad.third == 0)
+        #expect(quad.fourth == 0)
+        #expect(reader.bitPosition == bits)
+    }
+}
+
+@Test
 func `round trips encoded sine wave`() throws {
     let sampleRate = 44100
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)

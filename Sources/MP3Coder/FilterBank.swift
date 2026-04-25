@@ -140,18 +140,6 @@ private let prototypeFilter: [Double] = [
     0.000015259, 0.000015259, 0.000015259, 0.000015259
 ]
 
-/// Analysis matrix cosine values M[k][n] = cos(pi/64 * (2k+1) * (n-16)) for k=0..31, n=0..63
-/// Matches ISO 11172-3 synthesis matrix N[row][column] = cos(pi(2*column+1)(16-row)/64) (analysis is transpose)
-private let analysisMatrix: [[Double]] = {
-    var matrix = [[Double]](repeating: [Double](repeating: 0, count: 64), count: 32)
-    for subband in 0 ..< 32 {
-        for tap in 0 ..< 64 {
-            matrix[subband][tap] = cos(Double.pi / 64.0 * Double(2 * subband + 1) * Double(tap - 16))
-        }
-    }
-    return matrix
-}()
-
 /// Polyphase analysis filter bank per channel.
 ///
 /// Maintains a 512-sample history in a mirrored 1024-slot ring buffer so that
@@ -165,14 +153,11 @@ final class PolyphaseFilterBank {
     private var history: ContiguousArray<Double>
     /// Index in `history` of the newest sample (= logical index 0). Range 0..<512.
     private var head: Int = 0
-    /// Scratch: element-wise history*D (512 Doubles), then summed into `windowedPartials`.
-    private var windowedScratch: ContiguousArray<Double>
     /// Scratch buffer for the 64 windowed values (reused across calls).
     private var windowedPartials: ContiguousArray<Double>
 
     init() {
         history = ContiguousArray(repeating: 0, count: 1024)
-        windowedScratch = ContiguousArray(repeating: 0, count: 512)
         windowedPartials = ContiguousArray(repeating: 0, count: 64)
     }
 
@@ -238,7 +223,7 @@ final class PolyphaseFilterBank {
                             partialIndex += 4
                         }
 
-                        // Analysis matrix: output[subband] = sum_tap analysisMatrix[subband][tap] * partials[tap] (32 × 64 · 64 × 1).
+                        // Analysis matrix: output[subband] = sum_tap M[subband][tap] * partials[tap] (32 × 64 · 64 × 1).
                         for subband in 0 ..< 32 {
                             let rowRaw = UnsafeRawPointer(analysisMatrixBase).advanced(by: subband * 64 * 8)
                             var accumulator = rowRaw.load(as: SIMD4<Double>.self)
@@ -261,12 +246,13 @@ final class PolyphaseFilterBank {
 /// Flat copy of `D` for contiguous pointer access.
 private let prototypeFilterFlat: ContiguousArray<Double> = ContiguousArray(prototypeFilter)
 
-/// Flat row-major copy of `analysisMatrix`, 32 × 64 Doubles, for fast contiguous access.
+/// Flat row-major analysis matrix, 32 × 64 Doubles, for fast contiguous access.
+/// Values are M[k][n] = cos(pi/64 * (2k+1) * (n-16)).
 private let analysisMatrixFlat: ContiguousArray<Double> = {
     var flat = ContiguousArray<Double>(repeating: 0, count: 32 * 64)
     for subband in 0 ..< 32 {
         for tap in 0 ..< 64 {
-            flat[subband * 64 + tap] = analysisMatrix[subband][tap]
+            flat[subband * 64 + tap] = cos(Double.pi / 64.0 * Double(2 * subband + 1) * Double(tap - 16))
         }
     }
     return flat
@@ -303,17 +289,6 @@ final class SynthesisFilterBank {
     init() {
         synthesisFIFO = ContiguousArray(repeating: 0, count: 2048)
         shuffleScratch = ContiguousArray(repeating: 0, count: 512)
-    }
-
-    func synthesize(_ subband: [Double]) -> [Float] {
-        precondition(subband.count == 32)
-        var pcm = [Float](repeating: 0, count: 32)
-        pcm.withUnsafeMutableBufferPointer { pcmBuffer in
-            subband.withUnsafeBufferPointer { subbandBuffer in
-                synthesize(subband: subbandBuffer.baseAddress!, output: pcmBuffer.baseAddress!)
-            }
-        }
-        return pcm
     }
 
     /// Compute 32 PCM samples from 32 subband values, writing into `output`.

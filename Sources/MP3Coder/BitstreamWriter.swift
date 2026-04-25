@@ -50,11 +50,6 @@ final class BitstreamWriter {
         writeBits(UInt64(value & 1), count: 1)
     }
 
-    @inline(__always)
-    func writeByte(_ byte: UInt8) {
-        writeBits(UInt64(byte), count: 8)
-    }
-
     /// Pad to byte boundary with zeros.
     func byteAlign() {
         if bitsInAccumulator > 0 {

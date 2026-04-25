@@ -23,6 +23,12 @@ final class Quantizer {
     private var scaledBuffer: ContiguousArray<Float>
     private var quantizedInt32: ContiguousArray<Int32>
     private var quantizedScratch: ContiguousArray<Int>
+    private var scaleFactorScratch: ContiguousArray<Float>
+    private var originalDoubleScratch: ContiguousArray<Double>
+    private var quantizedMagnitudeDoubleScratch: ContiguousArray<Double>
+    private var cbrtDoubleScratch: ContiguousArray<Double>
+    private var decodedDoubleScratch: ContiguousArray<Double>
+    private var diffDoubleScratch: ContiguousArray<Double>
 
     init(sampleRate: Int) {
         scaleFactorBandBounds = MP3Constants.scaleFactorBandBoundaries(sampleRate: sampleRate)
@@ -31,6 +37,12 @@ final class Quantizer {
         scaledBuffer = ContiguousArray(repeating: 0, count: 576)
         quantizedInt32 = ContiguousArray(repeating: 0, count: 576)
         quantizedScratch = ContiguousArray(repeating: 0, count: 576)
+        scaleFactorScratch = ContiguousArray(repeating: 0, count: 576)
+        originalDoubleScratch = ContiguousArray(repeating: 0, count: 576)
+        quantizedMagnitudeDoubleScratch = ContiguousArray(repeating: 0, count: 576)
+        cbrtDoubleScratch = ContiguousArray(repeating: 0, count: 576)
+        decodedDoubleScratch = ContiguousArray(repeating: 0, count: 576)
+        diffDoubleScratch = ContiguousArray(repeating: 0, count: 576)
     }
 
     // MARK: - Vectorized quantize
@@ -170,27 +182,9 @@ final class Quantizer {
         return bits
     }
 
-    func countBits(quantized: [Int], granuleInfo: inout GranuleInfo) -> Int {
-        quantized.withUnsafeBufferPointer { buffer in
-            countBits(quantized: buffer, granuleInfo: &granuleInfo)
-        }
-    }
-
-    /// Scale factors are currently left neutral by this simplified encoder; see notes below.
-    func computeScaleFactors(spectral: [Float]) -> (scaleFactors: [Int], scaleFactorScale: Bool, scaleFactorCompress: Int) {
-        let bandCount = scaleFactorBandBounds.count - 1
-        return (Array(repeating: 0, count: bandCount), false, 0)
-    }
-
     // MARK: - Rate control
 
     /// Inner loop: binary-search the minimum global_gain that fits within `targetBits`.
-    func innerLoop(spectral: [Float], targetBits: Int, granuleInfo: inout GranuleInfo) -> [Int] {
-        spectral.withUnsafeBufferPointer { spectralBuffer in
-            innerLoop(spectral: spectralBuffer, targetBits: targetBits, granuleInfo: &granuleInfo)
-        }
-    }
-
     func innerLoop(spectral: UnsafeBufferPointer<Float>, targetBits: Int, granuleInfo: inout GranuleInfo) -> [Int] {
         var lowerGain = 0
         var upperGain = 255
@@ -223,53 +217,286 @@ final class Quantizer {
         return Array(quantizedScratch)
     }
 
-    func outerLoop(spectral: [Float], targetBits: Int, granuleInfo: inout GranuleInfo) -> [Int] {
-        let scaleFactorResult = computeScaleFactors(spectral: spectral)
-        granuleInfo.scaleFactors = scaleFactorResult.scaleFactors
-        granuleInfo.scaleFactorScale = scaleFactorResult.scaleFactorScale
-        granuleInfo.scaleFactorCompress = scaleFactorResult.scaleFactorCompress
-        granuleInfo.part2Length = scaleFactorBits(granuleInfo: granuleInfo)
-
-        // The simplified encoder leaves all scale factors at 0, which means
-        // `applyScaleFactors` is a no-op; skip the needless copy in that case.
-        let availableBits = max(0, targetBits - granuleInfo.part2Length)
-        if granuleInfo.scaleFactors.allSatisfy({ $0 == 0 }) {
-            return innerLoop(spectral: spectral, targetBits: availableBits, granuleInfo: &granuleInfo)
-        }
-        let scaledSpectral = applyScaleFactors(
+    /// Quantize against the normal target first, then spend reservoir bits only when
+    /// measured distortion still exceeds the psychoacoustic thresholds.
+    func outerLoop(
+        spectral: [Float],
+        thresholds: [Float],
+        targetBits: Int,
+        reservoirBits: Int = 0,
+        granuleInfo: inout GranuleInfo
+    ) -> [Int] {
+        var baseInfo = granuleInfo
+        let baseQuantized = quantizeWithDistortionControl(
             spectral: spectral,
+            thresholds: thresholds,
+            targetBits: targetBits,
+            granuleInfo: &baseInfo
+        )
+
+        guard reservoirBits > 0 else {
+            granuleInfo = baseInfo
+            return baseQuantized
+        }
+
+        let pressure = maskingPressure(
+            spectral: spectral,
+            quantized: baseQuantized,
+            granuleInfo: baseInfo,
+            thresholds: thresholds
+        )
+        let extraBits = reservoirBitsToSpend(availableBits: reservoirBits, maskingPressure: pressure)
+        guard extraBits > 0 else {
+            granuleInfo = baseInfo
+            return baseQuantized
+        }
+
+        var reservoirInfo = granuleInfo
+        let reservoirQuantized = quantizeWithDistortionControl(
+            spectral: spectral,
+            thresholds: thresholds,
+            targetBits: targetBits + extraBits,
+            granuleInfo: &reservoirInfo
+        )
+        granuleInfo = reservoirInfo
+        return reservoirQuantized
+    }
+
+    /// ISO/IEC 11172-3 distortion-control loop. Each iteration quantizes at the current
+    /// scale factors, measures actual per-band distortion against the psychoacoustic
+    /// masking threshold, and amplifies only the bands whose noise still exceeds it.
+    /// The loop converges when every band is masked or hit its per-region cap.
+    private func quantizeWithDistortionControl(
+        spectral: [Float],
+        thresholds: [Float],
+        targetBits: Int,
+        granuleInfo: inout GranuleInfo
+    ) -> [Int] {
+        let bandCount = scaleFactorBandBounds.count - 1
+        // SFBs 11–20 span many spectral lines, so each SF unit there costs lots of
+        // Huffman bits; cap them tighter than the narrow low SFBs.
+        let lowBandCap = 4
+        let highBandCap = 2
+        let maxIterations = 3
+        // Hysteresis: only bump when noise is meaningfully above threshold (~3 dB),
+        // so bands sitting on the boundary don't toggle frame-to-frame.
+        let bumpMargin: Float = 2.0
+
+        var scaleFactors = [Int](repeating: 0, count: bandCount)
+        var resultQuantized: [Int] = []
+        var resultInfo = granuleInfo
+
+        for iteration in 0 ..< maxIterations {
+            var workingInfo = granuleInfo
+            workingInfo.scaleFactors = scaleFactors
+            workingInfo.scaleFactorScale = false
+            workingInfo.scaleFactorCompress = chooseScaleFactorCompress(for: scaleFactors) ?? 0
+            workingInfo.part2Length = scaleFactorBitCost(compress: workingInfo.scaleFactorCompress)
+
+            let availableBits = max(0, targetBits - workingInfo.part2Length)
+
+            let quantized: [Int]
+            if scaleFactors.allSatisfy({ $0 == 0 }) {
+                quantized = spectral.withUnsafeBufferPointer { spectralBuffer in
+                    innerLoop(spectral: spectralBuffer, targetBits: availableBits, granuleInfo: &workingInfo)
+                }
+            } else {
+                quantized = spectral.withUnsafeBufferPointer { spectralBuffer in
+                    scaleFactorScratch.withUnsafeMutableBufferPointer { scaledBuffer in
+                        applyScaleFactors(
+                            spectral: spectralBuffer,
+                            scaleFactors: scaleFactors,
+                            scaleFactorScale: workingInfo.scaleFactorScale,
+                            destination: scaledBuffer
+                        )
+                        return innerLoop(
+                            spectral: UnsafeBufferPointer(start: scaledBuffer.baseAddress!, count: spectralBuffer.count),
+                            targetBits: availableBits,
+                            granuleInfo: &workingInfo
+                        )
+                    }
+                }
+            }
+            resultQuantized = quantized
+            resultInfo = workingInfo
+
+            if iteration == maxIterations - 1 {
+                break
+            }
+
+            let distortion = perBandDistortion(
+                originalSpectral: spectral,
+                quantized: quantized,
+                globalGain: workingInfo.globalGain,
+                scaleFactors: scaleFactors,
+                scaleFactorScale: workingInfo.scaleFactorScale
+            )
+
+            var anyBumped = false
+            for band in 0 ..< bandCount {
+                let cap = band < 11 ? lowBandCap : highBandCap
+                guard scaleFactors[band] < cap else {
+                    continue
+                }
+                let threshold = band < thresholds.count ? thresholds[band] : 0
+                guard threshold > 0 else {
+                    continue
+                }
+                if distortion[band] > threshold * bumpMargin {
+                    scaleFactors[band] += 1
+                    anyBumped = true
+                }
+            }
+
+            if !anyBumped {
+                break
+            }
+        }
+
+        granuleInfo = resultInfo
+        return resultQuantized
+    }
+
+    private func maskingPressure(
+        spectral: [Float],
+        quantized: [Int],
+        granuleInfo: GranuleInfo,
+        thresholds: [Float]
+    ) -> Float {
+        let distortion = perBandDistortion(
+            originalSpectral: spectral,
+            quantized: quantized,
+            globalGain: granuleInfo.globalGain,
             scaleFactors: granuleInfo.scaleFactors,
             scaleFactorScale: granuleInfo.scaleFactorScale
         )
-        return innerLoop(spectral: scaledSpectral, targetBits: availableBits, granuleInfo: &granuleInfo)
+
+        var pressure: Float = 0
+        for band in 0 ..< min(distortion.count, thresholds.count) {
+            let threshold = thresholds[band]
+            guard threshold > 0 else {
+                continue
+            }
+            pressure = max(pressure, distortion[band] / threshold)
+        }
+        return pressure
     }
 
-    func scaleFactorBits(granuleInfo: GranuleInfo) -> Int {
-        scaleFactorBitCost(compress: granuleInfo.scaleFactorCompress)
+    private func reservoirBitsToSpend(availableBits: Int, maskingPressure: Float) -> Int {
+        guard maskingPressure > 1.5 else {
+            return 0
+        }
+        guard maskingPressure < 8 else {
+            return availableBits
+        }
+
+        let start = log2(Float(1.5))
+        let end = log2(Float(8.0))
+        let fraction = (log2(maskingPressure) - start) / (end - start)
+        return Int((Float(availableBits) * fraction).rounded())
     }
 
-    private func applyScaleFactors(spectral: [Float], scaleFactors: [Int], scaleFactorScale: Bool) -> [Float] {
+    /// Mirrors the decoder's requantize: `decoded = sign(q) * |q|^(4/3) * 2^((g-210)/4) * 2^(-sf * mult)`.
+    /// Compares against the unscaled original, so distortion is in the audio (post-decode) domain
+    /// and directly comparable to a band masking threshold expressed in the same units.
+    private func perBandDistortion(
+        originalSpectral: [Float],
+        quantized: [Int],
+        globalGain: Int,
+        scaleFactors: [Int],
+        scaleFactorScale: Bool
+    ) -> [Float] {
+        let bandCount = scaleFactorBandBounds.count - 1
+        var distortion = [Float](repeating: 0, count: bandCount)
+
+        let sampleCount = min(576, originalSpectral.count, quantized.count)
+        guard sampleCount > 0 else {
+            return distortion
+        }
+
+        var sampleCountInt32 = Int32(sampleCount)
+        originalSpectral.withUnsafeBufferPointer { originalBuffer in
+            originalDoubleScratch.withUnsafeMutableBufferPointer { originalDouble in
+                vDSP_vspdp(originalBuffer.baseAddress!, 1, originalDouble.baseAddress!, 1, vDSP_Length(sampleCount))
+            }
+        }
+
+        quantizedMagnitudeDoubleScratch.withUnsafeMutableBufferPointer { magnitudes in
+            decodedDoubleScratch.withUnsafeMutableBufferPointer { decoded in
+                let magnitudeBase = magnitudes.baseAddress!
+                let decodedBase = decoded.baseAddress!
+                for index in 0 ..< sampleCount {
+                    let value = quantized[index]
+                    magnitudeBase[index] = Double(abs(value))
+                }
+
+                cbrtDoubleScratch.withUnsafeMutableBufferPointer { roots in
+                    vvcbrt(roots.baseAddress!, magnitudeBase, &sampleCountInt32)
+                    vDSP_vmulD(roots.baseAddress!, 1, magnitudeBase, 1, decodedBase, 1, vDSP_Length(sampleCount))
+                    for index in 0 ..< sampleCount where quantized[index] < 0 {
+                        decodedBase[index] = -decodedBase[index]
+                    }
+                }
+            }
+        }
+
+        let gainScale = pow(2.0, Double(globalGain - 210) * 0.25)
         let multiplier = scaleFactorScale ? 1.0 : 0.5
-        var scaled = spectral
 
-        for band in 0 ..< min(scaleFactors.count, scaleFactorBandBounds.count - 1) {
+        for band in 0 ..< bandCount {
             let bandStart = scaleFactorBandBounds[band]
-            let bandEnd = min(scaleFactorBandBounds[band + 1], scaled.count)
+            let bandEnd = min(scaleFactorBandBounds[band + 1], sampleCount)
             guard bandStart < bandEnd else {
                 continue
             }
 
-            let factor = Float(pow(2.0, multiplier * Double(scaleFactors[band])))
+            let scaleFactor = band < scaleFactors.count ? scaleFactors[band] : 0
+            var bandFactor = gainScale * pow(2.0, -Double(scaleFactor) * multiplier)
+            let bandLength = vDSP_Length(bandEnd - bandStart)
+
+            decodedDoubleScratch.withUnsafeMutableBufferPointer { decoded in
+                originalDoubleScratch.withUnsafeBufferPointer { original in
+                    diffDoubleScratch.withUnsafeMutableBufferPointer { diff in
+                        let decodedBand = decoded.baseAddress! + bandStart
+                        let originalBand = original.baseAddress! + bandStart
+                        let diffBand = diff.baseAddress! + bandStart
+                        vDSP_vsmulD(decodedBand, 1, &bandFactor, decodedBand, 1, bandLength)
+                        vDSP_vsubD(decodedBand, 1, originalBand, 1, diffBand, 1, bandLength)
+                        var bandDistortion = 0.0
+                        vDSP_svesqD(diffBand, 1, &bandDistortion, bandLength)
+                        distortion[band] = Float(bandDistortion)
+                    }
+                }
+            }
+        }
+
+        return distortion
+    }
+
+    private func applyScaleFactors(
+        spectral: UnsafeBufferPointer<Float>,
+        scaleFactors: [Int],
+        scaleFactorScale: Bool,
+        destination: UnsafeMutableBufferPointer<Float>
+    ) {
+        let multiplier = scaleFactorScale ? 1.0 : 0.5
+        let count = min(spectral.count, destination.count)
+        destination.baseAddress!.update(from: spectral.baseAddress!, count: count)
+
+        for band in 0 ..< min(scaleFactors.count, scaleFactorBandBounds.count - 1) {
+            let bandStart = scaleFactorBandBounds[band]
+            let bandEnd = min(scaleFactorBandBounds[band + 1], count)
+            guard bandStart < bandEnd else {
+                continue
+            }
+
+            var factor = Float(pow(2.0, multiplier * Double(scaleFactors[band])))
             if factor == 1 {
                 continue
             }
 
-            for spectralIndex in bandStart ..< bandEnd {
-                scaled[spectralIndex] *= factor
-            }
+            vDSP_vsmul(destination.baseAddress! + bandStart, 1, &factor, destination.baseAddress! + bandStart, 1, vDSP_Length(bandEnd - bandStart))
         }
-
-        return scaled
     }
 
     private func chooseScaleFactorCompress(for scaleFactors: [Int]) -> Int? {

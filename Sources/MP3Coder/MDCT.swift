@@ -150,13 +150,6 @@ final class MDCTProcessor {
             }
         }
     }
-
-    /// Reset overlap buffers.
-    func reset() {
-        for index in 0 ..< overlapBuffer.count {
-            overlapBuffer[index] = 0
-        }
-    }
 }
 
 /// Row-major 18×36 precomputed MDCT cosine table: `cosine[spectralLine * 36 + sampleIndex]`.

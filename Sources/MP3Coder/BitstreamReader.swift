@@ -70,6 +70,25 @@ final class BitstreamReader {
         return Int(accumulator >> (64 - count))
     }
 
+    /// Peek up to `count` bits, padding missing low-order bits with zero.
+    ///
+    /// Huffman lookup tables are indexed by fixed-width prefixes, but the last
+    /// Huffman code in a part can have fewer physical bits following it than the
+    /// lookup width. Padding only affects the table lookup; callers must still
+    /// verify the matched code length before consuming bits.
+    @inline(__always)
+    func peekBitsPadded(_ count: Int) throws -> Int {
+        do {
+            return try peekBits(count)
+        } catch BitstreamReaderError.endOfData {
+            let available = bitsRemaining
+            guard available > 0, available < count else {
+                throw BitstreamReaderError.endOfData
+            }
+            return try peekBits(available) << (count - available)
+        }
+    }
+
     /// Consume `count` bits that have already been peeked. `count` must be ≤ bitsInAccumulator.
     @inline(__always)
     func consumeBits(_ count: Int) {

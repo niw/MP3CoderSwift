@@ -32,11 +32,9 @@ public final class MP3Encoder {
     private var inputReadPos: Int = 0 // samples already consumed into frames
 
     // Bit reservoir state
-    private var reservoir: Int = 0 // bits in reservoir
+    private var reservoir: Int = 0 // bits available from the previous frame's spare main-data bytes
     private let maxReservoir: Int = 511 * 8 // MPEG1: 9-bit main_data_begin
-
-    // Frame counter
-    private var frameCount: Int = 0
+    private var pendingFrame: PendingMP3Frame?
 
     // MARK: - Scratch buffers (preallocated in init, reused every frame)
 
@@ -66,14 +64,16 @@ public final class MP3Encoder {
         (144 * bitrate * 1000) / sampleRate
     }
 
-    /// Bits available per granule (per channel)
-    var bitsPerGranule: Int {
-        let frameBytes = frameSizeBytes
-        let headerBytes = 4
-        let sideInfoBytes = channels == 1 ? 17 : 32
-        let dataBytes = frameBytes - headerBytes - sideInfoBytes
-        // Two granules per frame, each encoded independently per channel.
-        return (dataBytes * 8) / (2 * channels)
+    private struct PendingMP3Frame {
+        var granuleInfos: [[GranuleInfo]]
+        var mainData: Data
+        var mainDataBegin: Int
+        var mainDataCapacity: Int
+        var paddingBit: Bool
+
+        var availableReservoirBytes: Int {
+            max(0, mainDataCapacity - max(0, mainData.count - mainDataBegin))
+        }
     }
 
     // MARK: - Init
@@ -127,16 +127,24 @@ public final class MP3Encoder {
     /// Flush remaining samples (pads with zeros if needed)
     public func flush() -> Data {
         let remaining = inputBuffer.count - inputReadPos
-        guard remaining > 0 else {
-            return Data()
+        var output = Data()
+
+        if remaining > 0 {
+            let fpS = samplesPerFrame * channels
+            let needed = fpS - (remaining % fpS)
+            if needed > 0, needed < fpS {
+                inputBuffer.append(contentsOf: repeatElement(Float(0), count: needed))
+            }
+            output.append(drainFrames())
         }
 
-        let fpS = samplesPerFrame * channels
-        let needed = fpS - (remaining % fpS)
-        if needed > 0, needed < fpS {
-            inputBuffer.append(contentsOf: repeatElement(Float(0), count: needed))
+        if let pendingFrame {
+            output.append(renderFrame(pendingFrame, futureMainDataPrefix: Data()))
+            self.pendingFrame = nil
+            reservoir = 0
         }
-        return drainFrames()
+
+        return output
     }
 
     private func drainFrames() -> Data {
@@ -178,6 +186,9 @@ public final class MP3Encoder {
                 }
             }
         }
+
+        let baseTargetBits = max(0, (mainDataBytesForCurrentFrame * 8) / (2 * channels))
+        var reservoirBitsRemaining = min(reservoir, maxReservoir)
 
         for granule in 0 ..< 2 {
             let granuleSampleOffset = granule * 576
@@ -230,15 +241,25 @@ public final class MP3Encoder {
                 let spectralArray: [Float] = granuleSpectralScratch.withUnsafeBufferPointer { source in
                     Array(UnsafeBufferPointer(start: source.baseAddress!.advanced(by: spectralBase), count: 576))
                 }
-                let quantized = quantizer.outerLoop(spectral: spectralArray, targetBits: bitsPerGranule, granuleInfo: &granuleInfo)
+                let thresholds = psychoModel.computeThresholds(spectral: spectralArray)
+                let quantized = quantizer.outerLoop(
+                    spectral: spectralArray,
+                    thresholds: thresholds,
+                    targetBits: baseTargetBits,
+                    reservoirBits: reservoirBitsRemaining,
+                    granuleInfo: &granuleInfo
+                )
                 granuleQuantizedScratch[granule * channels + channel].withUnsafeMutableBufferPointer { destination in
                     quantized.withUnsafeBufferPointer { source in
                         destination.baseAddress!.update(from: source.baseAddress!, count: 576)
                     }
                 }
 
-                let huffmanBits = quantizer.countBits(quantized: quantized, granuleInfo: &granuleInfo)
+                let huffmanBits = quantized.withUnsafeBufferPointer { quantizedBuffer in
+                    quantizer.countBits(quantized: quantizedBuffer, granuleInfo: &granuleInfo)
+                }
                 granuleInfo.part2_3_length = granuleInfo.part2Length + huffmanBits
+                reservoirBitsRemaining = max(0, reservoirBitsRemaining - max(0, granuleInfo.part2_3_length - baseTargetBits))
                 granuleInfosScratch[granule][channel] = granuleInfo
             }
         }
@@ -269,30 +290,62 @@ public final class MP3Encoder {
             }
         }
         mainDataWriter.byteAlign()
-        var mainDataRaw = mainDataWriter.toData()
+        let mainDataRaw = mainDataWriter.toData()
 
-        // The quantizer is responsible for staying within this budget. Truncating
-        // would corrupt the Huffman stream and make following frame boundaries fail.
-        if mainDataRaw.count > mainDataBytes {
-            assertionFailure("MP3 main data exceeded frame payload: \(mainDataRaw.count) > \(mainDataBytes)")
-            mainDataRaw = mainDataRaw.prefix(mainDataBytes)
-        } else {
-            let paddingCount = mainDataBytes - mainDataRaw.count
-            if paddingCount > 0 {
-                mainDataRaw.append(Data(repeating: 0, count: paddingCount))
-            }
+        var currentFrame = PendingMP3Frame(
+            granuleInfos: granuleInfosScratch,
+            mainData: mainDataRaw,
+            mainDataBegin: 0,
+            mainDataCapacity: mainDataBytes,
+            paddingBit: paddingBit
+        )
+
+        var output = Data()
+        if let previousFrame = pendingFrame {
+            let carriedBytes = min(previousFrame.availableReservoirBytes, currentFrame.mainData.count, maxReservoir / 8)
+            currentFrame.mainDataBegin = carriedBytes
+            output.append(renderFrame(previousFrame, futureMainDataPrefix: currentFrame.mainData.prefix(carriedBytes)))
         }
+
+        pendingFrame = currentFrame
+        reservoir = min(currentFrame.availableReservoirBytes * 8, maxReservoir)
+
+        return output
+    }
+
+    private var mainDataBytesForCurrentFrame: Int {
+        let headerBytes = 4
+        let sideInfoBytes = channels == 1 ? 17 : 32
+        return frameSizeBytes - headerBytes - sideInfoBytes
+    }
+
+    private func renderFrame(_ frame: PendingMP3Frame, futureMainDataPrefix: Data) -> Data {
+        var mainDataPayload = Data(capacity: frame.mainDataCapacity)
+        mainDataPayload.append(contentsOf: frame.mainData.dropFirst(frame.mainDataBegin))
+
+        // The quantizer should stay within the current frame plus real bytes carried
+        // by the previous frame. Truncating is a last-resort guard for malformed input.
+        if mainDataPayload.count + futureMainDataPrefix.count > frame.mainDataCapacity {
+            assertionFailure("MP3 main data exceeded reservoir-adjusted payload: \(mainDataPayload.count) > \(frame.mainDataCapacity)")
+            mainDataPayload = mainDataPayload.prefix(max(0, frame.mainDataCapacity - futureMainDataPrefix.count))
+        }
+
+        let fillerCount = frame.mainDataCapacity - mainDataPayload.count - futureMainDataPrefix.count
+        if fillerCount > 0 {
+            mainDataPayload.append(Data(repeating: 0, count: fillerCount))
+        }
+        mainDataPayload.append(contentsOf: futureMainDataPrefix)
 
         // Header + side info are exactly `headerBytes + sideInfoBytes` once byte-aligned;
         // build them in their own bitstream writer and concatenate the main data
-        // directly as bytes — no per-byte bit-level round trip.
+        // directly as bytes - no per-byte bit-level round trip.
+        let headerBytes = 4
+        let sideInfoBytes = channels == 1 ? 17 : 32
         let headerWriter = BitstreamWriter(reserveBytes: headerBytes + sideInfoBytes)
-        writeHeader(writer: headerWriter, paddingBit: paddingBit)
-        writeSideInfo(writer: headerWriter, granuleInfos: granuleInfosScratch)
+        writeHeader(writer: headerWriter, paddingBit: frame.paddingBit)
+        writeSideInfo(writer: headerWriter, granuleInfos: frame.granuleInfos, mainDataBegin: frame.mainDataBegin)
         var frame = headerWriter.toData()
-        frame.append(mainDataRaw)
-
-        frameCount += 1
+        frame.append(mainDataPayload)
         return frame
     }
 
@@ -342,9 +395,9 @@ public final class MP3Encoder {
 
     // MARK: - Side info writing
 
-    private func writeSideInfo(writer: BitstreamWriter, granuleInfos: [[GranuleInfo]]) {
-        // main_data_begin (9 bits): 0 = no reservoir
-        writer.writeBits(0, count: 9)
+    private func writeSideInfo(writer: BitstreamWriter, granuleInfos: [[GranuleInfo]], mainDataBegin: Int) {
+        // main_data_begin (9 bits): bytes to read from previous frames' main data.
+        writer.writeBits(min(mainDataBegin, 511), count: 9)
 
         // private_bits: 5 for mono, 3 for stereo
         let privateBits = channels == 1 ? 5 : 3
