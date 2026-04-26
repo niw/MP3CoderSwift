@@ -10,7 +10,6 @@ import ArgumentParser
 @main
 struct MP3CoderCLI: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "mp3coder",
         subcommands: [EncodeCommand.self, DecodeCommand.self]
     )
 }

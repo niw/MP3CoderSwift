@@ -61,8 +61,8 @@ Use the `release` configuration for testing because `debug` is really slow.
 
 ```shell
 # Encode a WAV file
-swift run -c release mp3coder encode --output encoded.mp3 input.wav
+swift run -c release mp3coder-cli encode --output encoded.mp3 input.wav
 
 # Decode an MP3 file
-swift run -c release mp3coder decode --output decoded.wav encoded.mp3
+swift run -c release mp3coder-cli decode --output decoded.wav encoded.mp3
 ```

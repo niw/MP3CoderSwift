@@ -19,7 +19,7 @@ let package = Package(
             ]
         ),
         .executable(
-            name: "mp3coder",
+            name: "mp3coder-cli",
             targets: [
                 "MP3CoderCLI"
             ]
@@ -30,7 +30,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "MP3Coder",
+            name: "MP3Coder"
         ),
         .target(
             name: "MP3CoderAVAudio",
