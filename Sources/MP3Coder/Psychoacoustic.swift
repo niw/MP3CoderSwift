@@ -11,12 +11,10 @@ import Foundation
 /// (1) a frequency-dependent SNR target shaped by the absolute threshold of hearing,
 /// and (2) a one-tap spreading function so a loud band raises its neighbours' tolerance.
 struct PsychoacousticModel {
-    var sampleRate: Int
     var scaleFactorBandBounds: [Int]
     private var snrTargetsDb: [Double]
 
     init(sampleRate: Int) {
-        self.sampleRate = sampleRate
         let bounds = MP3Constants.scaleFactorBandBoundaries(sampleRate: sampleRate)
         scaleFactorBandBounds = bounds
 

@@ -448,9 +448,9 @@ private func pairTable(_ tableIndex: Int) -> PairHuffmanTable? {
 
 // MARK: - Encoder fast-path cost lookup
 
-// Per-table primitive struct holding everything `huffmanPairBits` needs without
-// going through `[PairHuffmanTable?]` (which copies a `PairHuffmanTable` —
-// containing two CoW arrays — on every call) or even an Optional unwrap. The
+// Per-table primitive struct holding everything `huffmanPairBitsFast` needs
+// without going through `[PairHuffmanTable?]` (which copies a `PairHuffmanTable`
+// — containing two CoW arrays — on every call) or even an Optional unwrap. The
 // cost data lives in a process-lifetime `UnsafeBufferPointer<UInt16>` so callers
 // can read it via the buffer pointer without bumping any refcounts in the inner loop.
 
@@ -905,7 +905,7 @@ func huffmanDecodeQuad(reader: BitstreamReader, tableIndex: Int) throws -> (firs
 }
 
 /// Pick the best Huffman table for values in `[start, end)` and also return its bit cost.
-/// Walks the range once across all candidates via `huffmanPairBits`, so the subsequent
+/// Walks the range once across all candidates via `huffmanPairBitsFast`, so the subsequent
 /// `countHuffmanBits` step in `Quantizer.countBits` is avoided.
 func selectHuffmanTableAndBits(values: UnsafeBufferPointer<Int>, start: Int, end: Int) -> (tableIndex: Int, bits: Int) {
     let upperBound = min(end, values.count)
@@ -1065,22 +1065,6 @@ func countHuffmanBits3(
     return (totalFirst, totalSecond, totalThird)
 }
 
-/// Count the number of bits the pair (firstValue, secondValue) would take with the given table.
-/// Returns `huffmanOverflowBits` if the pair cannot be encoded.
-/// This is the hot path for the rate-control binary search: ~5× faster than
-/// calling `huffmanEncodePair` and discarding the code.
-@inline(__always)
-func huffmanPairBits(firstValue: Int, secondValue: Int, tableIndex: Int) -> Int {
-    if tableIndex == 0 || tableIndex >= huffmanCostTables.count {
-        return 0
-    }
-    return huffmanPairBitsFast(
-        absoluteFirst: abs(firstValue),
-        absoluteSecond: abs(secondValue),
-        info: huffmanCostTables[tableIndex]
-    )
-}
-
 func countHuffmanBits(values: UnsafeBufferPointer<Int>, start: Int, end: Int, tableIndex: Int) -> Int {
     if tableIndex == 0 || tableIndex >= huffmanCostTables.count {
         return 0
@@ -1101,15 +1085,6 @@ func countHuffmanBits(values: UnsafeBufferPointer<Int>, start: Int, end: Int, ta
         pairIndex += 2
     }
     return total
-}
-
-@inline(__always)
-func countQuadBits(first: Int, second: Int, third: Int, fourth: Int, tableIndex: Int) -> Int {
-    let index = (min(abs(first), 1) << 3)
-        | (min(abs(second), 1) << 2)
-        | (min(abs(third), 1) << 1)
-        | min(abs(fourth), 1)
-    return tableIndex == 0 ? quadTableA.lengths[index] : quadTableB.lengths[index]
 }
 
 /// Fused both-table quad cost. The count1 region picks the cheaper of two

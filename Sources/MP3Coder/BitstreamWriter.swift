@@ -15,7 +15,6 @@ final class BitstreamWriter {
     private var output: ContiguousArray<UInt8>
     private var accumulator: UInt64 = 0
     private var bitsInAccumulator: Int = 0
-    private(set) var totalBitsWritten: Int = 0
 
     init(reserveBytes: Int = 0) {
         output = ContiguousArray<UInt8>()
@@ -30,7 +29,6 @@ final class BitstreamWriter {
         guard count > 0 else {
             return
         }
-        totalBitsWritten += count
         let masked = count >= 64 ? value : (value & ((UInt64(1) << count) - 1))
         accumulator = (accumulator << count) | masked
         bitsInAccumulator += count
@@ -57,14 +55,6 @@ final class BitstreamWriter {
         }
     }
 
-    var bitPosition: Int {
-        totalBitsWritten
-    }
-
-    var byteCount: Int {
-        (totalBitsWritten + 7) / 8
-    }
-
     /// Finalize and return bytes. The trailing partial byte (if any) is MSB-aligned and zero-padded.
     func toData() -> Data {
         if bitsInAccumulator == 0 {
@@ -81,6 +71,5 @@ final class BitstreamWriter {
         output.removeAll(keepingCapacity: true)
         accumulator = 0
         bitsInAccumulator = 0
-        totalBitsWritten = 0
     }
 }

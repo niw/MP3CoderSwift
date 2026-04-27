@@ -67,8 +67,4 @@ final class TransientDetector {
         previousEnergy = maxEnergy
         return isTransient
     }
-
-    func reset() {
-        previousEnergy = 0
-    }
 }

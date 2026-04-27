@@ -70,15 +70,6 @@ public enum MP3EncoderError: Error, Equatable, Sendable {
     case unsupportedChannelCount(Int)
 }
 
-// MARK: - Channel mode
-
-enum ChannelMode: UInt8 {
-    case stereo = 0
-    case jointStereo = 1
-    case dualChannel = 2
-    case mono = 3
-}
-
 // MARK: - Granule info (side information per granule per channel)
 
 struct GranuleInfo {
@@ -99,31 +90,4 @@ struct GranuleInfo {
     var scaleFactors: [Int] = Array(repeating: 0, count: 22) // long block scale factors
     var scaleFactorsShort: [Int] = Array(repeating: 0, count: 39) // short block scale factors, indexed [window * 13 + band]
     var part2Length: Int = 0 // bits for scale factors
-}
-
-// MARK: - Frame header
-
-struct MP3FrameHeader {
-    var id: Int = 1 // MPEG1 = 1
-    var layer: Int = 1 // Layer3 = 01 (layer field in header = 01 for layer3... wait, it's 01 for layer2, 11 for layer1)
-    // Actually: layer bits: 11=Layer1, 10=Layer2, 01=Layer3
-    var protectionBit: Bool = true // 1 = no CRC
-    var bitrateIndex: Int = 9 // 128 kbps default
-    var samplingFreqIndex: Int = 0 // 44100 Hz
-    var paddingBit: Bool = false
-    var privateBit: Bool = false
-    var mode: ChannelMode = .mono
-    var modeExtension: Int = 0
-    var copyright: Bool = false
-    var original: Bool = true
-    var emphasis: Int = 0
-}
-
-// MARK: - MP3 Frame
-
-struct MP3Frame {
-    var header: MP3FrameHeader
-    var sideInfo: [[GranuleInfo]] // [granule][channel]
-    var spectralData: [[[Float]]] // [granule][channel][576]
-    var quantized: [[[Int]]] // [granule][channel][576]
 }

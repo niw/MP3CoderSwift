@@ -34,10 +34,6 @@ public final class MP3Encoder {
     /// Maps a bitstream slot for short blocks to the matching encoder MDCT slot
     /// (subband-major). Built once per sample rate.
     private let shortReorderTable: [Int]
-    /// Per bitstream slot: the short scale-factor band that owns it.
-    private let shortBandTable: [Int]
-    /// Per bitstream slot: which of the three short windows owns it.
-    private let shortWindowTable: [Int]
 
     // MARK: - State
 
@@ -157,7 +153,6 @@ public final class MP3Encoder {
         var mainData: Data
         var mainDataBegin: Int
         var mainDataCapacity: Int
-        var paddingBit: Bool
         /// Channel mode for the frame header (`stereo` (0), `jointStereo` (1), or `mono` (3)).
         var channelMode: Int
         /// Mode-extension bits, used by jointStereo to flag M/S (`0b10`) and intensity stereo
@@ -197,8 +192,6 @@ public final class MP3Encoder {
         previousLongBlockGain = Array(repeating: 0, count: channels)
 
         shortReorderTable = ShortBlockLayout.bitstreamReorderTable(sampleRate: sampleRate)
-        shortBandTable = ShortBlockLayout.bitstreamBandTable(sampleRate: sampleRate)
-        shortWindowTable = ShortBlockLayout.bitstreamWindowTable(sampleRate: sampleRate)
 
         let spf = 1152
         channelSamplesScratch = ContiguousArray(repeating: 0, count: channels * spf)
@@ -347,15 +340,13 @@ public final class MP3Encoder {
                     if channels == 1 {
                         nextFrameTransientScratch[0] = transientPreview(
                             pcm: UnsafeBufferPointer(rebasing: inputRegion[lookaheadStart...]),
-                            stride: 1,
-                            channel: 0
+                            stride: 1
                         )
                     } else {
                         for channel in 0 ..< channels {
                             nextFrameTransientScratch[channel] = transientPreview(
                                 pcm: UnsafeBufferPointer(rebasing: inputRegion[(lookaheadStart + channel)...]),
-                                stride: 2,
-                                channel: channel
+                                stride: 2
                             )
                         }
                     }
@@ -784,8 +775,7 @@ public final class MP3Encoder {
     /// energy history stays aligned with the granules we actually encode.
     private func transientPreview(
         pcm: UnsafeBufferPointer<Float>,
-        stride sampleStride: Int,
-        channel _: Int
+        stride sampleStride: Int
     ) -> Bool {
         // Strided sum-of-squares directly on the interleaved input — no de-interleave
         // copy. The detector is a heuristic so single-precision accumulation is fine.
@@ -821,13 +811,9 @@ public final class MP3Encoder {
     // MARK: - Bitstream writing
 
     private func writeBitstream(useMidSide: Bool) -> Data {
-        let nominalFrameSize = frameSizeBytes
-        let paddingBit = false
-        let frameSize = paddingBit ? nominalFrameSize + 1 : nominalFrameSize
-
         let headerBytes = 4
         let sideInfoBytes = channels == 1 ? 17 : 32
-        let mainDataBytes = frameSize - headerBytes - sideInfoBytes
+        let mainDataBytes = frameSizeBytes - headerBytes - sideInfoBytes
 
         // Write main data (scale factors + Huffman)
         let mainDataRaw: Data = measure(.writeMainData) {
@@ -871,7 +857,6 @@ public final class MP3Encoder {
             mainData: mainDataRaw,
             mainDataBegin: 0,
             mainDataCapacity: mainDataBytes,
-            paddingBit: paddingBit,
             channelMode: channelMode,
             modeExtension: modeExtension
         )
@@ -923,7 +908,6 @@ public final class MP3Encoder {
         let headerWriter = BitstreamWriter(reserveBytes: headerBytes + sideInfoBytes)
         writeHeader(
             writer: headerWriter,
-            paddingBit: frame.paddingBit,
             channelMode: frame.channelMode,
             modeExtension: frame.modeExtension
         )
@@ -937,7 +921,6 @@ public final class MP3Encoder {
 
     private func writeHeader(
         writer: BitstreamWriter,
-        paddingBit: Bool,
         channelMode: Int,
         modeExtension: Int
     ) {
@@ -959,8 +942,8 @@ public final class MP3Encoder {
         // Sampling frequency index
         writer.writeBits(sampleRateIndex, count: 2)
 
-        // Padding bit
-        writer.writeBit(paddingBit ? 1 : 0)
+        // Padding bit (always 0 — frame size matches the bitrate exactly).
+        writer.writeBit(0)
 
         // Private bit
         writer.writeBit(0)

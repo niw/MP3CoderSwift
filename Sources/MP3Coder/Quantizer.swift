@@ -18,9 +18,6 @@ final class Quantizer {
     /// Per bitstream slot, which short window (0..2) owns it. Used by `outerLoopShort`
     /// to compute per-window energy and pre-scale by 2^(2*sg_w).
     private let shortWindowTable: [Int]
-    /// Per bitstream slot, which short scale-factor band (0..11) owns it. Used by
-    /// the short-block per-(window, band) scale factor optimization.
-    private let shortBandTable: [Int]
 
     // MARK: - Scratch (all sized for 576 spectral lines)
 
@@ -37,15 +34,12 @@ final class Quantizer {
     private var decodedFloatScratch: ContiguousArray<Float>
     private var diffFloatScratch: ContiguousArray<Float>
     private var distortionScratch: ContiguousArray<Float>
-    /// Per-(window, band) energy scratch for short blocks (3 windows × 12 short bands).
-    private var shortBandEnergyScratch: ContiguousArray<Double>
     /// Per-bitstream-slot scratch for the subblock-gain pre-scaled spectral.
     private var shortPreScaledScratch: ContiguousArray<Float>
-    /// Cache of `|spectral|^0.75` populated once per `innerLoop` call. Steps 1–4
-    /// of `quantizeInto` (vabs, vvsqrtf, vmul, vvsqrtf) only depend on the
+    /// Cache of `|spectral|^0.75` populated once per `innerLoop` call. The four
+    /// Accelerate stages (vabs, vvsqrtf, vmul, vvsqrtf) only depend on the
     /// spectral input, not on `globalGain`, so the binary search reuses this
-    /// across every probe instead of recomputing the four-stage Accelerate
-    /// pipeline.
+    /// across every probe instead of recomputing the four-stage pipeline.
     private var absPow075Cache: ContiguousArray<Float>
 
     /// Pre-allocated zero arrays handed to `GranuleInfo.scaleFactors` /
@@ -89,7 +83,6 @@ final class Quantizer {
     init(sampleRate: Int) {
         scaleFactorBandBounds = MP3Constants.scaleFactorBandBoundaries(sampleRate: sampleRate)
         shortWindowTable = ShortBlockLayout.bitstreamWindowTable(sampleRate: sampleRate)
-        shortBandTable = ShortBlockLayout.bitstreamBandTable(sampleRate: sampleRate)
         absoluteBuffer = ContiguousArray(repeating: 0, count: 576)
         sqrtBuffer = ContiguousArray(repeating: 0, count: 576)
         scaledBuffer = ContiguousArray(repeating: 0, count: 576)
@@ -101,7 +94,6 @@ final class Quantizer {
         decodedFloatScratch = ContiguousArray(repeating: 0, count: 576)
         diffFloatScratch = ContiguousArray(repeating: 0, count: 576)
         distortionScratch = ContiguousArray(repeating: 0, count: max(1, scaleFactorBandBounds.count - 1))
-        shortBandEnergyScratch = ContiguousArray(repeating: 0, count: 3 * 13)
         shortPreScaledScratch = ContiguousArray(repeating: 0, count: 576)
         zeroScaleFactorsLong = Array(repeating: 0, count: max(1, scaleFactorBandBounds.count - 1))
         distortionScaleFactorsScratch = Array(repeating: 0, count: max(1, scaleFactorBandBounds.count - 1))
@@ -109,23 +101,6 @@ final class Quantizer {
     }
 
     // MARK: - Vectorized quantize
-
-    /// Quantize all 576 spectral values into `destination`.
-    /// Formula: `quantized[i] = sign(x) * trunc(|x|^0.75 / 2^((g-210)/4) + 0.4054)`.
-    ///
-    /// One-shot path: prepares the gain-independent `|x|^0.75` cache, then
-    /// finishes with `quantizeFromCachedAbsPow075`. Callers that probe the same
-    /// spectral with multiple gains (the rate-control binary search) should
-    /// hit `prepareAbsPow075Cache` once and `quantizeFromCachedAbsPow075` per
-    /// probe to avoid redoing the four-stage Accelerate pipeline.
-    func quantizeInto(
-        spectral: UnsafeBufferPointer<Float>,
-        globalGain: Int,
-        destination: UnsafeMutableBufferPointer<Int>
-    ) {
-        prepareAbsPow075Cache(spectral: spectral)
-        quantizeFromCachedAbsPow075(spectral: spectral, globalGain: globalGain, destination: destination)
-    }
 
     /// Compute `|spectral|^0.75` once into `absPow075Cache`. Independent of
     /// `globalGain`, so a single call covers every binary-search probe.
@@ -669,17 +644,11 @@ final class Quantizer {
             destination: destination,
             distortion: distortion,
             granuleInfo: &granuleInfo
-        ).huffmanBits
-    }
-
-    private struct DistortionControlResult {
-        var huffmanBits: Int
-        var cappedBandStillAudible: Bool
+        )
     }
 
     /// One full distortion-control pass at a fixed `scaleFactorScale`. Returns the
-    /// Huffman bit count plus a flag indicating whether any band ended capped with
-    /// residual distortion (a future scale=1 retry hint that's not currently used).
+    /// Huffman bit count.
     private func distortionControlPass(
         spectral: UnsafeBufferPointer<Float>,
         thresholds: [Float],
@@ -688,7 +657,7 @@ final class Quantizer {
         destination: UnsafeMutableBufferPointer<Int>,
         distortion: UnsafeMutableBufferPointer<Float>,
         granuleInfo: inout GranuleInfo
-    ) -> DistortionControlResult {
+    ) -> Int {
         let bandCount = scaleFactorBandBounds.count - 1
         // SFBs 11–20 span many spectral lines, so each SF unit there costs lots of
         // Huffman bits; cap them tighter than the narrow low SFBs.
@@ -781,36 +750,8 @@ final class Quantizer {
             }
         }
 
-        // Detect whether the granule is a genuine "needs more amplification range"
-        // case worth paying the scale=1 retry cost for. We require ≥ 6 bands capped
-        // with residual distortion ≥ 8× threshold (≈ 9 dB above masking) — i.e.
-        // the granule is broadly distortion-limited at the SF cap, not just
-        // marginal in a few places. Looser thresholds here easily double encoder
-        // runtime for negligible quality gain because most music produces a few
-        // capped bands as a matter of course.
-        let retryBandThreshold = 6
-        let retryDistortionMargin: Float = bumpMargin * 4
-        var cappedAudibleBands = 0
-        for band in 0 ..< bandCount {
-            let cap = band < 11 ? lowBandCap : highBandCap
-            guard scaleFactors[band] >= cap else {
-                continue
-            }
-            let threshold = band < thresholds.count ? thresholds[band] : 0
-            guard threshold > 0 else {
-                continue
-            }
-            if distortion[band] > threshold * retryDistortionMargin {
-                cappedAudibleBands += 1
-                if cappedAudibleBands >= retryBandThreshold {
-                    break
-                }
-            }
-        }
-        let cappedBandStillAudible = cappedAudibleBands >= retryBandThreshold
-
         granuleInfo = resultInfo
-        return DistortionControlResult(huffmanBits: resultBits, cappedBandStillAudible: cappedBandStillAudible)
+        return resultBits
     }
 
     private func maskingPressure(
@@ -988,7 +929,7 @@ final class Quantizer {
     // so the encoder stays bit-equivalent with the previous inline path.
 
     /// Encoder-side per-`global_gain` scale: `2^(-(g-210)/4)` for g ∈ [0, 255].
-    /// Used by `quantizeInto` once per binary-search probe (~10-20× per granule).
+    /// Used by `quantizeFromCachedAbsPow075` once per binary-search probe (~10-20× per granule).
     private static let encoderGainScale: [Float] = (0 ..< 256).map { gain in
         Float(pow(2.0, -Double(gain - 210) * 0.25))
     }
