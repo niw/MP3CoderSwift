@@ -166,7 +166,7 @@ public final class MP3Encoder {
 
     // MARK: - Init
 
-    public init(sampleRate: Int, channels: Int, bitrate: Int) throws {
+    public init(sampleRate: Int, channels: Int, bitrate: Int = 128) throws {
         guard let srIdx = MP3Constants.sampleRates.firstIndex(of: sampleRate) else {
             throw MP3EncoderError.unsupportedSampleRate(sampleRate)
         }

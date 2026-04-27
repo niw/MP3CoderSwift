@@ -23,7 +23,7 @@ extension AVAudioPCMBuffer {
     /// Resamples to the nearest MPEG-1 Layer 3 sample rate when needed.
     /// The optional `progress` closure is called with values in `0.0...1.0`.
     public func encodedMP3Data(
-        bitrate: Int,
+        bitrate: Int = 128,
         progress: ((Double) -> Void)? = nil
     ) throws -> Data {
         let sourceSampleRate = Int(format.sampleRate)
