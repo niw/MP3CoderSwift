@@ -152,19 +152,19 @@ public final class MP3Encoder {
         var nextLongBlockGain: Int
     }
 
-    /// `@unchecked Sendable` shim for raw pointers handed into the per-channel
+    /// `@unchecked Sendable` shim for buffer pointers handed into the per-channel
     /// `concurrentPerform` closure. Each parallel worker writes to a disjoint
     /// slot, so the unchecked conformance is a contract documented at the
     /// call site (one slot per worker) rather than a global guarantee.
     private struct ConcurrentPointer<T>: @unchecked Sendable {
-        var base: UnsafeMutablePointer<T>
+        var base: UnsafeMutableBufferPointer<T>
     }
 
     /// Read-only counterpart to `ConcurrentPointer`. The spectral input is
     /// shared by both workers but never written, so an unchecked Sendable
     /// shim is enough to hand it across the @Sendable closure boundary.
     private struct ConcurrentReadonlyPointer<T>: @unchecked Sendable {
-        var base: UnsafePointer<T>
+        var base: UnsafeBufferPointer<T>
     }
 
     private struct PendingMP3Frame {
@@ -344,9 +344,12 @@ public final class MP3Encoder {
                     let channelOffset = channel * samplesPerFrameCount
                     for granule in 0 ..< 2 {
                         let granuleOffset = channelOffset + granule * samplesPerGranule
+                        let granuleSlice = UnsafeBufferPointer(
+                            start: channelBase.advanced(by: granuleOffset),
+                            count: samplesPerGranule
+                        )
                         transientFlagsScratch[granule][channel] = transientDetectors[channel].detectTransient(
-                            pcm: channelBase.advanced(by: granuleOffset),
-                            samplesPerGranule: samplesPerGranule
+                            pcm: granuleSlice
                         )
                     }
                 }
@@ -355,17 +358,17 @@ public final class MP3Encoder {
             if hasLookahead {
                 // Peek (don't consume) one more granule to drive granule-1's lookahead.
                 inputBuffer.withUnsafeBufferPointer { inputRegion in
-                    let lookaheadBase = inputRegion.baseAddress! + sampleBase + samplesPerFrameCount * channels
+                    let lookaheadStart = sampleBase + samplesPerFrameCount * channels
                     if channels == 1 {
                         nextFrameTransientScratch[0] = transientPreview(
-                            pcm: lookaheadBase,
+                            pcm: UnsafeBufferPointer(rebasing: inputRegion[lookaheadStart...]),
                             stride: 1,
                             channel: 0
                         )
                     } else {
                         for channel in 0 ..< channels {
                             nextFrameTransientScratch[channel] = transientPreview(
-                                pcm: lookaheadBase + channel,
+                                pcm: UnsafeBufferPointer(rebasing: inputRegion[(lookaheadStart + channel)...]),
                                 stride: 2,
                                 channel: channel
                             )
@@ -413,14 +416,12 @@ public final class MP3Encoder {
                     channelSamplesScratch.withUnsafeBufferPointer { channelBuffer in
                         filterBankOutputScratch.withUnsafeMutableBufferPointer { filterBankOutput in
                             subbandScratch.withUnsafeMutableBufferPointer { subbandBuffer in
-                                let channelBase = channelBuffer.baseAddress!
                                 for slot in 0 ..< 18 {
                                     let sampleOffset = channelSampleBase + granuleSampleOffset + slot * 32
                                     filterBanks[channel].analyze(
-                                        input: channelBase,
+                                        input: channelBuffer,
                                         inputOffset: sampleOffset,
-                                        inputLength: channelBuffer.count,
-                                        output: filterBankOutput.baseAddress!
+                                        output: filterBankOutput
                                     )
                                     for subband in 0 ..< 32 {
                                         subbandBuffer[subband * 18 + slot] = filterBankOutput[subband]
@@ -439,9 +440,9 @@ public final class MP3Encoder {
                         subbandScratch.withUnsafeBufferPointer { subbandBuffer in
                             shortReorderScratch.withUnsafeMutableBufferPointer { reorderBuffer in
                                 mdctProcessors[channel].processGranule(
-                                    subbandSamples: subbandBuffer.baseAddress!,
+                                    subbandSamples: subbandBuffer,
                                     blockType: .shortBlocks,
-                                    output: reorderBuffer.baseAddress!
+                                    output: reorderBuffer
                                 )
                                 for index in 0 ..< 576 {
                                     reorderBuffer[index] *= spectralScale
@@ -460,12 +461,15 @@ public final class MP3Encoder {
                     } else {
                         subbandScratch.withUnsafeBufferPointer { subbandBuffer in
                             granuleSpectralScratch.withUnsafeMutableBufferPointer { destination in
-                                mdctProcessors[channel].processGranule(
-                                    subbandSamples: subbandBuffer.baseAddress!,
-                                    blockType: blockType,
-                                    output: destination.baseAddress!.advanced(by: spectralBase)
+                                let outputSlice = UnsafeMutableBufferPointer(
+                                    start: destination.baseAddress!.advanced(by: spectralBase),
+                                    count: 576
                                 )
-                                let outputSlice = destination.baseAddress!.advanced(by: spectralBase)
+                                mdctProcessors[channel].processGranule(
+                                    subbandSamples: subbandBuffer,
+                                    blockType: blockType,
+                                    output: outputSlice
+                                )
                                 for spectralIndex in 0 ..< 576 {
                                     outputSlice[spectralIndex] *= spectralScale
                                 }
@@ -542,7 +546,7 @@ public final class MP3Encoder {
                         channel: 0,
                         channels: channelsLocal,
                         blockType: blockTypesScratch[granule][0],
-                        spectralBase: spectralSource.baseAddress!,
+                        spectralBuffer: spectralSource,
                         psychoModel: psychoModelLocal,
                         quantizer: quantizers[0],
                         baseTargetBits: baseTargetBits,
@@ -573,10 +577,10 @@ public final class MP3Encoder {
 
         granuleSpectralScratch.withUnsafeBufferPointer { spectralSource in
             granuleQuantizedScratch.withUnsafeMutableBufferPointer { quantizedBuffer in
-                let quantizedSlot = ConcurrentPointer(base: quantizedBuffer.baseAddress!)
-                let spectralSlot = ConcurrentReadonlyPointer(base: spectralSource.baseAddress!)
+                let quantizedSlot = ConcurrentPointer(base: quantizedBuffer)
+                let spectralSlot = ConcurrentReadonlyPointer(base: spectralSource)
 
-                let resultsBox = UnsafeMutablePointer<ChannelQuantizationResult>.allocate(capacity: 2)
+                let resultsBox = UnsafeMutableBufferPointer<ChannelQuantizationResult>.allocate(capacity: 2)
                 defer { resultsBox.deallocate() }
                 let resultsSlot = ConcurrentPointer(base: resultsBox)
 
@@ -585,7 +589,7 @@ public final class MP3Encoder {
                     let priorGain = channel == 0 ? priorGain0 : priorGain1
                     let quantizer = channel == 0 ? quantizer0 : quantizer1
                     let destination = UnsafeMutableBufferPointer(
-                        start: quantizedSlot.base.advanced(by: (granuleLocal * 2 + channel) * 576),
+                        start: quantizedSlot.base.baseAddress!.advanced(by: (granuleLocal * 2 + channel) * 576),
                         count: 576
                     )
                     let result = Self.quantizeChannelSlot(
@@ -593,7 +597,7 @@ public final class MP3Encoder {
                         channel: channel,
                         channels: 2,
                         blockType: blockType,
-                        spectralBase: spectralSlot.base,
+                        spectralBuffer: spectralSlot.base,
                         psychoModel: psychoModelLocal,
                         quantizer: quantizer,
                         baseTargetBits: baseTargetBitsLocal,
@@ -601,14 +605,14 @@ public final class MP3Encoder {
                         previousLongGain: priorGain,
                         destination: destination
                     )
-                    resultsSlot.base.advanced(by: channel).initialize(to: result)
+                    (resultsSlot.base.baseAddress! + channel).initialize(to: result)
                 }
 
                 granuleInfosScratch[granule][0] = resultsBox[0].info
                 granuleInfosScratch[granule][1] = resultsBox[1].info
                 previousLongBlockGain[0] = resultsBox[0].nextLongBlockGain
                 previousLongBlockGain[1] = resultsBox[1].nextLongBlockGain
-                resultsBox.deinitialize(count: 2)
+                resultsBox.deinitialize()
             }
         }
     }
@@ -621,7 +625,7 @@ public final class MP3Encoder {
         channel: Int,
         channels: Int,
         blockType: MDCTBlockType,
-        spectralBase: UnsafePointer<Float>,
+        spectralBuffer: UnsafeBufferPointer<Float>,
         psychoModel: PsychoacousticModel,
         quantizer: Quantizer,
         baseTargetBits: Int,
@@ -671,10 +675,8 @@ public final class MP3Encoder {
             granuleInfo.globalGain = previousLongGain
         }
 
-        let spectralSlice = UnsafeBufferPointer(
-            start: spectralBase.advanced(by: (granule * channels + channel) * 576),
-            count: 576
-        )
+        let spectralStart = (granule * channels + channel) * 576
+        let spectralSlice = UnsafeBufferPointer(rebasing: spectralBuffer[spectralStart ..< spectralStart + 576])
         let thresholds = psychoModel.computeThresholds(spectral: spectralSlice)
         let huffmanBits = quantizer.outerLoop(
             spectral: spectralSlice,
@@ -799,7 +801,7 @@ public final class MP3Encoder {
     /// of the current frame. We don't update detector state here so the per-channel
     /// energy history stays aligned with the granules we actually encode.
     private func transientPreview(
-        pcm: UnsafePointer<Float>,
+        pcm: UnsafeBufferPointer<Float>,
         stride sampleStride: Int,
         channel _: Int
     ) -> Bool {
@@ -813,13 +815,14 @@ public final class MP3Encoder {
         let length = vDSP_Length(subWindowSize)
         let stride = vDSP_Stride(sampleStride)
         let inverseLength = 1.0 / Double(subWindowSize)
+        let pcmBase = pcm.baseAddress!
 
         var maxEnergy = 0.0
         var minEnergy = Double.greatestFiniteMagnitude
         for windowIndex in 0 ..< 3 {
             let start = windowIndex * subWindowSize * sampleStride
             var sumOfSquares: Float = 0
-            vDSP_svesq(pcm.advanced(by: start), stride, &sumOfSquares, length)
+            vDSP_svesq(pcmBase.advanced(by: start), stride, &sumOfSquares, length)
             let energy = Double(sumOfSquares) * inverseLength
             if energy > maxEnergy {
                 maxEnergy = energy

@@ -451,8 +451,8 @@ private func pairTable(_ tableIndex: Int) -> PairHuffmanTable? {
 // Per-table primitive struct holding everything `huffmanPairBits` needs without
 // going through `[PairHuffmanTable?]` (which copies a `PairHuffmanTable` —
 // containing two CoW arrays — on every call) or even an Optional unwrap. The
-// cost data lives in process-lifetime UnsafeMutablePointer storage so callers
-// can read it via raw pointer without bumping any refcounts in the inner loop.
+// cost data lives in a process-lifetime `UnsafeBufferPointer<UInt16>` so callers
+// can read it via the buffer pointer without bumping any refcounts in the inner loop.
 
 struct HuffmanCostTable: @unchecked Sendable {
     /// `xlen - 1`. Anything above this is unencodable for non-linbits tables.
@@ -463,9 +463,9 @@ struct HuffmanCostTable: @unchecked Sendable {
     var linbits: Int
     /// Maximum value for `(absolute - 15)` before linbits saturates.
     var linmax: Int
-    /// Pointer into a process-lifetime allocation of `xlen * xlen` UInt16 cost
+    /// View over a process-lifetime allocation of `xlen * xlen` UInt16 cost
     /// entries (sign bits already folded in). `nil` for table 0 / undefined.
-    var costsBase: UnsafePointer<UInt16>?
+    var costs: UnsafeBufferPointer<UInt16>?
 }
 
 let huffmanCostTables: [HuffmanCostTable] = {
@@ -478,12 +478,12 @@ let huffmanCostTables: [HuffmanCostTable] = {
                 xlen: 0,
                 linbits: 0,
                 linmax: 0,
-                costsBase: nil
+                costs: nil
             ))
             continue
         }
         let entryCount = table.lengths.count
-        let storage = UnsafeMutablePointer<UInt16>.allocate(capacity: entryCount)
+        let storage = UnsafeMutableBufferPointer<UInt16>.allocate(capacity: entryCount)
         for entry in 0 ..< entryCount {
             storage[entry] = UInt16(table.lengths[entry])
         }
@@ -492,7 +492,7 @@ let huffmanCostTables: [HuffmanCostTable] = {
             xlen: table.xlen,
             linbits: table.linbits,
             linmax: table.linmax,
-            costsBase: UnsafePointer(storage)
+            costs: UnsafeBufferPointer(storage)
         ))
     }
     return result
@@ -500,7 +500,7 @@ let huffmanCostTables: [HuffmanCostTable] = {
 
 @inline(__always)
 private func huffmanPairBitsFast(absoluteFirst: Int, absoluteSecond: Int, info: HuffmanCostTable) -> Int {
-    guard let costsBase = info.costsBase else {
+    guard let costs = info.costs else {
         return 0
     }
     var baseFirst = absoluteFirst
@@ -526,7 +526,7 @@ private func huffmanPairBitsFast(absoluteFirst: Int, absoluteSecond: Int, info: 
         return huffmanOverflowBits
     }
 
-    return totalBits + Int(costsBase[baseFirst * info.xlen + baseSecond])
+    return totalBits + Int(costs[baseFirst * info.xlen + baseSecond])
 }
 
 // MARK: - Decoder lookup tables

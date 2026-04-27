@@ -23,12 +23,12 @@ final class TransientDetector {
     /// blowing the ratio up on near-silent input).
     private let energyFloor: Double = 1e-9
 
-    /// Examine one granule's PCM (`pcm` length must equal `samplesPerGranule`).
+    /// Examine one granule's PCM (`pcm.count` is the granule length).
     /// Returns true if an internal sub-window spike or a frame-boundary jump
     /// exceeds the ratio threshold.
-    func detectTransient(pcm: UnsafePointer<Float>, samplesPerGranule: Int) -> Bool {
+    func detectTransient(pcm: UnsafeBufferPointer<Float>) -> Bool {
         let subWindowCount = 3
-        let subWindowSize = samplesPerGranule / subWindowCount
+        let subWindowSize = pcm.count / subWindowCount
         guard subWindowSize > 0 else {
             return false
         }

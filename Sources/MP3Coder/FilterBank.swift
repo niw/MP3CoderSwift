@@ -163,22 +163,21 @@ final class PolyphaseFilterBank {
 
     /// Process one block of 32 input samples, produce 32 subband output values.
     /// - Parameters:
-    ///   - input: pointer to the input-sample buffer.
+    ///   - input: input-sample buffer; samples past `input.count` read as 0.
     ///   - inputOffset: index of the first sample of this 32-sample block.
-    ///   - inputLength: total valid samples in `input`; samples past this read as 0.
-    ///   - output: destination for the 32 subband values (contiguous).
+    ///   - output: destination for the 32 subband values.
     func analyze(
-        input: UnsafePointer<Float>,
+        input: UnsafeBufferPointer<Float>,
         inputOffset: Int,
-        inputLength: Int,
-        output: UnsafeMutablePointer<Double>
+        output: UnsafeMutableBufferPointer<Double>
     ) {
         // Advance the ring head (logical shift by 32) and stamp the new 32 samples
         // (reversed so the newest is at head) into both mirror slots.
         head = (head - 32) & 511
+        let inputCount = input.count
         history.withUnsafeMutableBufferPointer { historyBuffer in
             let base = historyBuffer.baseAddress!
-            if inputOffset >= 0, inputOffset + 32 <= inputLength {
+            if inputOffset >= 0, inputOffset + 32 <= inputCount {
                 // Fast path: all 32 samples in bounds.
                 for sampleOffset in 0 ..< 32 {
                     let sampleValue = Double(input[inputOffset + (31 - sampleOffset)])
@@ -189,7 +188,7 @@ final class PolyphaseFilterBank {
             } else {
                 for sampleOffset in 0 ..< 32 {
                     let sourceIndex = inputOffset + (31 - sampleOffset)
-                    let sampleValue = (sourceIndex >= 0 && sourceIndex < inputLength) ? Double(input[sourceIndex]) : 0.0
+                    let sampleValue = (sourceIndex >= 0 && sourceIndex < inputCount) ? Double(input[sourceIndex]) : 0.0
                     let position = head + sampleOffset
                     base[position] = sampleValue
                     base[position + 512] = sampleValue
@@ -292,14 +291,14 @@ final class SynthesisFilterBank {
     }
 
     /// Compute 32 PCM samples from 32 subband values, writing into `output`.
-    func synthesize(subband: UnsafePointer<Double>, output: UnsafeMutablePointer<Float>) {
+    func synthesize(subband: UnsafeBufferPointer<Double>, output: UnsafeMutableBufferPointer<Float>) {
         head = (head - 64) & 1023
 
         synthesisFIFO.withUnsafeMutableBufferPointer { fifoBuffer in
             synthesisMatrixFlat.withUnsafeBufferPointer { matrixBuffer in
                 let fifoBase = fifoBuffer.baseAddress!
                 let matrixBase = matrixBuffer.baseAddress!
-                let subbandRaw = UnsafeRawPointer(subband)
+                let subbandRaw = UnsafeRawPointer(subband.baseAddress!)
 
                 // fifo[head..head+63] (mirrored also at +1024): 64-vector produced from
                 // 64×32 synthesis matrix · 32-vector, one row per matrixRow. SIMD4<Double>.

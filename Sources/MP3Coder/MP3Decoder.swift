@@ -139,7 +139,9 @@ public final class MP3Decoder {
         let mainDataSize = header.frameSize - 4 - sideInfoSize
 
         let sourceBase = bytes.baseAddress!
-        let sideReader = BitstreamReader(bytes: sourceBase + sideInfoStart, count: sideInfoSize)
+        let sideReader = BitstreamReader(
+            bytes: UnsafeBufferPointer(start: sourceBase + sideInfoStart, count: sideInfoSize)
+        )
 
         let mainDataBegin = try sideReader.readBits(9)
         guard mainDataBegin <= mainDataReservoir.count else {
@@ -219,7 +221,9 @@ public final class MP3Decoder {
         }
 
         try mainDataBuffer.withUnsafeBufferPointer { mainBuffer in
-            let mainReader = BitstreamReader(bytes: mainBuffer.baseAddress!, count: totalMainSize)
+            let mainReader = BitstreamReader(
+                bytes: UnsafeBufferPointer(start: mainBuffer.baseAddress!, count: totalMainSize)
+            )
             var previousScaleFactors = [[Int]?](repeating: nil, count: header.channels)
             var granuleInfoByChannel = [DecoderGranuleInfo](repeating: DecoderGranuleInfo(), count: header.channels)
 
@@ -250,10 +254,10 @@ public final class MP3Decoder {
                     quantizedScratch.withUnsafeBufferPointer { quantizedBuffer in
                         spectralByChannel[channel].withUnsafeMutableBufferPointer { spectralBuffer in
                             requantize(
-                                quantized: quantizedBuffer.baseAddress!,
+                                quantized: quantizedBuffer,
                                 granuleInfo: granuleInfo,
                                 sampleRate: header.sampleRate,
-                                output: spectralBuffer.baseAddress!
+                                output: spectralBuffer
                             )
                         }
                     }
@@ -271,10 +275,10 @@ public final class MP3Decoder {
                     spectralByChannel[channel].withUnsafeBufferPointer { spectralBuffer in
                         pcmByChannel[channel].withUnsafeMutableBufferPointer { pcmBuffer in
                             hybridDecoders[channel].processGranule(
-                                spectral: spectralBuffer.baseAddress!,
+                                spectral: spectralBuffer,
                                 blockType: granuleInfoByChannel[channel].blockType,
                                 mixedBlockFlag: granuleInfoByChannel[channel].mixedBlockFlag,
-                                output: pcmBuffer.baseAddress!
+                                output: pcmBuffer
                             )
                         }
                     }
@@ -285,7 +289,9 @@ public final class MP3Decoder {
         }
 
         // Update reservoir to keep the last 511 bytes of main_data available for the next frame.
-        appendCurrentMainDataToReservoir(source: sourceBase + mainDataStart, count: mainDataSize)
+        appendCurrentMainDataToReservoir(
+            source: UnsafeBufferPointer(start: sourceBase + mainDataStart, count: mainDataSize)
+        )
     }
 
     /// Append 576 PCM samples per channel to `output`, interleaved (LRLR…).
@@ -311,14 +317,14 @@ public final class MP3Decoder {
         }
     }
 
-    private func appendCurrentMainDataToReservoir(source: UnsafePointer<UInt8>, count: Int) {
-        if count >= 511 {
+    private func appendCurrentMainDataToReservoir(source: UnsafeBufferPointer<UInt8>) {
+        if source.count >= 511 {
             // Drop everything older than the last 511 bytes of this frame.
             mainDataReservoir.removeAll(keepingCapacity: true)
-            mainDataReservoir.append(contentsOf: UnsafeBufferPointer(start: source + (count - 511), count: 511))
+            mainDataReservoir.append(contentsOf: UnsafeBufferPointer(rebasing: source.suffix(511)))
             return
         }
-        mainDataReservoir.append(contentsOf: UnsafeBufferPointer(start: source, count: count))
+        mainDataReservoir.append(contentsOf: source)
         if mainDataReservoir.count > 511 {
             mainDataReservoir.removeFirst(mainDataReservoir.count - 511)
         }
@@ -466,10 +472,10 @@ public final class MP3Decoder {
     /// `|quantized|^(1/3) * |quantized| = |quantized|^(4/3)`). `cbrt` is vectorized via `vvcbrt`, absolute value via
     /// `vDSP_vabsD`, and the final scale-and-multiply is two `vDSP_vmulD`s.
     private func requantize(
-        quantized: UnsafePointer<Int>,
+        quantized: UnsafeBufferPointer<Int>,
         granuleInfo: DecoderGranuleInfo,
         sampleRate: Int,
-        output: UnsafeMutablePointer<Double>
+        output: UnsafeMutableBufferPointer<Double>
     ) {
         if granuleInfo.blockType == 2 {
             requantizeShort(quantized: quantized, granuleInfo: granuleInfo, sampleRate: sampleRate, output: output)
@@ -482,7 +488,6 @@ public final class MP3Decoder {
 
         // Build per-element `rqScale[i] = gainScale * 2^(-scaleFactor(band(i)) * multiplier)`.
         rqScale.withUnsafeMutableBufferPointer { scaleBuffer in
-            let scale = scaleBuffer.baseAddress!
             var band = 0
             var currentFactor = gainScale * pow(2.0, -Double(granuleInfo.scaleFactors[0]) * scaleFactorMultiplier)
             for spectralIndex in 0 ..< 576 {
@@ -492,14 +497,13 @@ public final class MP3Decoder {
                     let preemphasis = granuleInfo.preflag && band < decoderPreemphasis.count ? decoderPreemphasis[band] : 0
                     currentFactor = gainScale * pow(2.0, -Double(scaleFactor + preemphasis) * scaleFactorMultiplier)
                 }
-                scale[spectralIndex] = currentFactor
+                scaleBuffer[spectralIndex] = currentFactor
             }
         }
 
         rqSignedDouble.withUnsafeMutableBufferPointer { signedDoubleBuffer in
-            let signedDouble = signedDoubleBuffer.baseAddress!
             for spectralIndex in 0 ..< 576 {
-                signedDouble[spectralIndex] = Double(quantized[spectralIndex])
+                signedDoubleBuffer[spectralIndex] = Double(quantized[spectralIndex])
             }
         }
 
@@ -511,12 +515,13 @@ public final class MP3Decoder {
                         let absoluteValues = absoluteBuffer.baseAddress!
                         let cbrtValues = cbrtBuffer.baseAddress!
                         let scale = scaleBuffer.baseAddress!
+                        let outputBase = output.baseAddress!
 
                         vDSP_vabsD(signedDouble, 1, absoluteValues, 1, 576)
                         var length: Int32 = 576
                         vvcbrt(cbrtValues, signedDouble, &length)
-                        vDSP_vmulD(cbrtValues, 1, absoluteValues, 1, output, 1, 576)
-                        vDSP_vmulD(output, 1, scale, 1, output, 1, 576)
+                        vDSP_vmulD(cbrtValues, 1, absoluteValues, 1, outputBase, 1, 576)
+                        vDSP_vmulD(outputBase, 1, scale, 1, outputBase, 1, 576)
                     }
                 }
             }
@@ -524,10 +529,10 @@ public final class MP3Decoder {
     }
 
     private func requantizeShort(
-        quantized: UnsafePointer<Int>,
+        quantized: UnsafeBufferPointer<Int>,
         granuleInfo: DecoderGranuleInfo,
         sampleRate: Int,
-        output: UnsafeMutablePointer<Double>
+        output: UnsafeMutableBufferPointer<Double>
     ) {
         for index in 0 ..< 576 {
             output[index] = 0
@@ -685,7 +690,15 @@ private final class HybridSynthesisDecoder {
     }
 
     /// Write 576 PCM samples (18 time slots × 32 subbands) into `output`.
-    func processGranule(spectral input: UnsafePointer<Double>, blockType: Int, mixedBlockFlag: Bool, output: UnsafeMutablePointer<Float>) {
+    func processGranule(
+        spectral input: UnsafeBufferPointer<Double>,
+        blockType: Int,
+        mixedBlockFlag: Bool,
+        output: UnsafeMutableBufferPointer<Float>
+    ) {
+        let inputBase = input.baseAddress!
+        let outputBase = output.baseAddress!
+
         spectralScratch.withUnsafeMutableBufferPointer { spectralBuffer in
             imdctScratch.withUnsafeMutableBufferPointer { imdctBuffer in
                 subbandTime.withUnsafeMutableBufferPointer { subbandTimeBuffer in
@@ -696,25 +709,29 @@ private final class HybridSynthesisDecoder {
                         let overlapBase = overlapBuffer.baseAddress!
 
                         // Copy input → spectral scratch, then apply alias reduction in place.
-                        spectralBase.update(from: input, count: 576)
+                        spectralBase.update(from: inputBase, count: 576)
                         if blockType == 2 {
                             if mixedBlockFlag {
-                                applyAliasReduction(spectral: spectralBase, subbandLimit: 2)
+                                applyAliasReduction(spectral: spectralBuffer, subbandLimit: 2)
                             }
                         } else {
-                            applyAliasReduction(spectral: spectralBase, subbandLimit: 32)
+                            applyAliasReduction(spectral: spectralBuffer, subbandLimit: 32)
                         }
 
                         // Per subband: IMDCT, overlap-add, sign-flip, shuffle into subbandTime.
                         for subband in 0 ..< 32 {
                             let subbandBlockType = mixedBlockFlag && subband < 2 ? 0 : blockType
+                            let subbandSpectral = UnsafeBufferPointer(
+                                start: spectralBase.advanced(by: subband * 18),
+                                count: 18
+                            )
                             if subbandBlockType == 2 {
-                                imdctShortInto(input: spectralBase.advanced(by: subband * 18), output: imdctBase)
+                                imdctShortInto(input: subbandSpectral, output: imdctBuffer)
                             } else {
                                 imdctLongInto(
-                                    input: spectralBase.advanced(by: subband * 18),
+                                    input: subbandSpectral,
                                     blockType: subbandBlockType,
-                                    output: imdctBase
+                                    output: imdctBuffer
                                 )
                             }
                             let overlapForSubband = overlapBase.advanced(by: subband * 18)
@@ -731,8 +748,14 @@ private final class HybridSynthesisDecoder {
 
                         for slot in 0 ..< 18 {
                             synthesis.synthesize(
-                                subband: subbandTimeBase.advanced(by: slot * 32),
-                                output: output.advanced(by: slot * 32)
+                                subband: UnsafeBufferPointer(
+                                    start: subbandTimeBase.advanced(by: slot * 32),
+                                    count: 32
+                                ),
+                                output: UnsafeMutableBufferPointer(
+                                    start: outputBase.advanced(by: slot * 32),
+                                    count: 32
+                                )
                             )
                         }
                     }
@@ -741,7 +764,7 @@ private final class HybridSynthesisDecoder {
         }
     }
 
-    private func applyAliasReduction(spectral: UnsafeMutablePointer<Double>, subbandLimit: Int) {
+    private func applyAliasReduction(spectral: UnsafeMutableBufferPointer<Double>, subbandLimit: Int) {
         aliasCosineSinesFlat.withUnsafeBufferPointer { cosineSinesBuffer in
             aliasCosineAntisFlat.withUnsafeBufferPointer { cosineAntisBuffer in
                 let cosineSines = cosineSinesBuffer.baseAddress!
@@ -862,13 +885,19 @@ private func requantizedValue(_ quantized: Int) -> Double {
 /// Long/start/stop IMDCT: writes 36 doubles to `output` from 18 spectral coefficients. Uses SIMD4<Double>
 /// across the 18 (+ 2 zero-padding) cosine entries per row.
 @inline(__always)
-private func imdctLongInto(input: UnsafePointer<Double>, blockType: Int, output: UnsafeMutablePointer<Double>) {
+private func imdctLongInto(
+    input: UnsafeBufferPointer<Double>,
+    blockType: Int,
+    output: UnsafeMutableBufferPointer<Double>
+) {
     let stride = 20
+    let inputBase = input.baseAddress!
+    let outputBase = output.baseAddress!
     decoderIMDCTCosineFlat.withUnsafeBufferPointer { cosineBuffer in
         decoderWindow(for: blockType).withUnsafeBufferPointer { windowBuffer in
             let cosineBase = UnsafeRawPointer(cosineBuffer.baseAddress!)
             let windowBase = windowBuffer.baseAddress!
-            let inputRaw = UnsafeRawPointer(input)
+            let inputRaw = UnsafeRawPointer(inputBase)
 
             for sampleIndex in 0 ..< 36 {
                 let rowRaw = cosineBase.advanced(by: sampleIndex * stride * 8)
@@ -887,28 +916,32 @@ private func imdctLongInto(input: UnsafePointer<Double>, blockType: Int, output:
                 // of the valid region but are zeroed out against the padded cos row.
                 let inputTail = SIMD4<Double>(input[16], input[17], 0, 0)
                 accumulator += cosineTail * inputTail
-                output[sampleIndex] = (accumulator[0] + accumulator[1] + accumulator[2] + accumulator[3]) * windowBase[sampleIndex]
+                outputBase[sampleIndex] = (accumulator[0] + accumulator[1] + accumulator[2] + accumulator[3]) * windowBase[sampleIndex]
             }
         }
     }
 }
 
-private func imdctShortInto(input: UnsafePointer<Double>, output: UnsafeMutablePointer<Double>) {
+private func imdctShortInto(
+    input: UnsafeBufferPointer<Double>,
+    output: UnsafeMutableBufferPointer<Double>
+) {
     for sampleIndex in 0 ..< 36 {
         output[sampleIndex] = 0.0
     }
 
+    let inputBase = input.baseAddress!
     decoderShortIMDCTCosineFlat.withUnsafeBufferPointer { cosineBuffer in
         decoderShortWindow.withUnsafeBufferPointer { windowBuffer in
             let cosineBase = cosineBuffer.baseAddress!
             let windowBase = windowBuffer.baseAddress!
             for window in 0 ..< 3 {
-                let inputBase = input.advanced(by: window * 6)
+                let inputWindow = inputBase.advanced(by: window * 6)
                 for sampleIndex in 0 ..< 12 {
                     let cosineRow = cosineBase.advanced(by: sampleIndex * 6)
                     var accumulator = 0.0
                     for spectralLine in 0 ..< 6 {
-                        accumulator += inputBase[spectralLine] * cosineRow[spectralLine]
+                        accumulator += inputWindow[spectralLine] * cosineRow[spectralLine]
                     }
                     output[6 + window * 6 + sampleIndex] += accumulator * windowBase[sampleIndex]
                 }

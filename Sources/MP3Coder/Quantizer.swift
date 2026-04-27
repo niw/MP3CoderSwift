@@ -122,7 +122,11 @@ final class Quantizer: @unchecked Sendable {
     /// spectral with multiple gains (the rate-control binary search) should
     /// hit `prepareAbsPow075Cache` once and `quantizeFromCachedAbsPow075` per
     /// probe to avoid redoing the four-stage Accelerate pipeline.
-    func quantizeInto(spectral: UnsafePointer<Float>, globalGain: Int, destination: UnsafeMutablePointer<Int>) {
+    func quantizeInto(
+        spectral: UnsafeBufferPointer<Float>,
+        globalGain: Int,
+        destination: UnsafeMutableBufferPointer<Int>
+    ) {
         prepareAbsPow075Cache(spectral: spectral)
         quantizeFromCachedAbsPow075(spectral: spectral, globalGain: globalGain, destination: destination)
     }
@@ -130,12 +134,13 @@ final class Quantizer: @unchecked Sendable {
     /// Compute `|spectral|^0.75` once into `absPow075Cache`. Independent of
     /// `globalGain`, so a single call covers every binary-search probe.
     @inline(__always)
-    private func prepareAbsPow075Cache(spectral: UnsafePointer<Float>) {
+    private func prepareAbsPow075Cache(spectral: UnsafeBufferPointer<Float>) {
         let length: vDSP_Length = 576
         var lengthInt32: Int32 = 576
+        let spectralBase = spectral.baseAddress!
 
         absoluteBuffer.withUnsafeMutableBufferPointer { absoluteBuffer in
-            vDSP_vabs(spectral, 1, absoluteBuffer.baseAddress!, 1, length)
+            vDSP_vabs(spectralBase, 1, absoluteBuffer.baseAddress!, 1, length)
 
             sqrtBuffer.withUnsafeMutableBufferPointer { sqrtBuffer in
                 vvsqrtf(sqrtBuffer.baseAddress!, absoluteBuffer.baseAddress!, &lengthInt32)
@@ -155,13 +160,13 @@ final class Quantizer: @unchecked Sendable {
 
     /// Apply `inverseScale + bias` and the truncate-with-sign step using the
     /// cached `|x|^0.75`. Caller must have populated the cache via
-    /// `prepareAbsPow075Cache(spectral:)` (with the same spectral pointer used
+    /// `prepareAbsPow075Cache(spectral:)` (with the same spectral buffer used
     /// for the sign source here) before invoking this.
     @inline(__always)
     private func quantizeFromCachedAbsPow075(
-        spectral: UnsafePointer<Float>,
+        spectral: UnsafeBufferPointer<Float>,
         globalGain: Int,
-        destination: UnsafeMutablePointer<Int>
+        destination: UnsafeMutableBufferPointer<Int>
     ) {
         let length: vDSP_Length = 576
         let clampedGain = max(0, min(255, globalGain))
@@ -177,9 +182,8 @@ final class Quantizer: @unchecked Sendable {
 
                 quantizedInt32.withUnsafeMutableBufferPointer { quantizedInt32 in
                     vDSP_vfix32(scaledBuffer.baseAddress!, 1, quantizedInt32.baseAddress!, 1, length)
-                    let quantizedBase = quantizedInt32.baseAddress!
                     for index in 0 ..< 576 {
-                        let magnitude = Int(quantizedBase[index])
+                        let magnitude = Int(quantizedInt32[index])
                         destination[index] = spectral[index] < 0 ? -magnitude : magnitude
                     }
                 }
@@ -328,12 +332,9 @@ final class Quantizer: @unchecked Sendable {
         // Compute |x|^0.75 once for this spectral input — every probe and the
         // smoothing fallback reuses it via `quantizeFromCachedAbsPow075`,
         // removing ~80% of the Accelerate work per probe.
-        prepareAbsPow075Cache(spectral: spectral.baseAddress!)
+        prepareAbsPow075Cache(spectral: spectral)
 
         quantizedScratch.withUnsafeMutableBufferPointer { quantizedBuffer in
-            let spectralBase = spectral.baseAddress!
-            let scratchBase = quantizedBuffer.baseAddress!
-
             // Local probe helper. Returns (bits, info) at `gain`. The
             // destination is the shared scratch buffer; the caller is
             // responsible for re-running the chosen gain into the real
@@ -342,7 +343,7 @@ final class Quantizer: @unchecked Sendable {
             func probe(_ gain: Int) -> (bits: Int, info: GranuleInfo) {
                 bumpCounter(.innerLoopProbes)
                 var info = granuleInfo
-                quantizeFromCachedAbsPow075(spectral: spectralBase, globalGain: gain, destination: scratchBase)
+                quantizeFromCachedAbsPow075(spectral: spectral, globalGain: gain, destination: quantizedBuffer)
                 let bits = countBits(quantized: UnsafeBufferPointer(quantizedBuffer), granuleInfo: &info)
                 return (bits, info)
             }
@@ -462,7 +463,7 @@ final class Quantizer: @unchecked Sendable {
         }
 
         // Produce bestGain's quantized values directly into the caller's buffer.
-        quantizeFromCachedAbsPow075(spectral: spectral.baseAddress!, globalGain: bestGain, destination: destination.baseAddress!)
+        quantizeFromCachedAbsPow075(spectral: spectral, globalGain: bestGain, destination: destination)
         bumpCounter(.innerLoopProbes)
 
         granuleInfo = bestGranuleInfo

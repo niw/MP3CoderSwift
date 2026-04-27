@@ -133,16 +133,16 @@ final class MDCTProcessor {
 
     /// Process one granule.
     /// - Parameters:
-    ///   - subbandSamples: pointer to a 32×18 block indexed as `subband * 18 + sample`.
+    ///   - subbandSamples: 32×18 block indexed as `subband * 18 + sample` (576 doubles).
     ///   - blockType: long/start/short/stop. Determines window shape, MDCT layout, and whether
     ///     alias reduction is applied (only for long-style blocks).
-    ///   - output: pointer to 576 Float slots written with the spectral coefficients in the
+    ///   - output: 576 Float slots written with the spectral coefficients in the
     ///     subband-major encoder layout (subband * 18 + spectralLine). Caller is responsible for
     ///     reordering short-block lines into bitstream layout.
     func processGranule(
-        subbandSamples: UnsafePointer<Double>,
+        subbandSamples: UnsafeBufferPointer<Double>,
         blockType: MDCTBlockType,
-        output: UnsafeMutablePointer<Float>
+        output: UnsafeMutableBufferPointer<Float>
     ) {
         if blockType == .shortBlocks {
             processShortGranule(subbandSamples: subbandSamples, output: output)
@@ -160,6 +160,9 @@ final class MDCTProcessor {
             longWindow // unreachable
         }
 
+        let subbandSamplesBase = subbandSamples.baseAddress!
+        let outputBase = output.baseAddress!
+
         overlapBuffer.withUnsafeMutableBufferPointer { overlap in
             windowedScratch.withUnsafeMutableBufferPointer { windowed in
                 spectralScratch.withUnsafeMutableBufferPointer { spectral in
@@ -172,7 +175,7 @@ final class MDCTProcessor {
 
                             for subband in 0 ..< 32 {
                                 let overlapBase = overlap.baseAddress!.advanced(by: subband * 18)
-                                let inputBase = subbandSamples.advanced(by: subband * 18)
+                                let inputBase = subbandSamplesBase.advanced(by: subband * 18)
                                 let flipOdd = (subband & 1) == 1
 
                                 // Window the previous overlap into `windowed[0..17]`.
@@ -238,7 +241,7 @@ final class MDCTProcessor {
 
                             // Copy-out to Float, 4 at a time.
                             let sourceRaw = UnsafeRawPointer(spectral.baseAddress!)
-                            let destinationRaw = UnsafeMutableRawPointer(output)
+                            let destinationRaw = UnsafeMutableRawPointer(outputBase)
                             for offset in stride(from: 0, to: 576, by: 4) {
                                 let doubles = sourceRaw.load(fromByteOffset: offset * 8, as: SIMD4<Double>.self)
                                 let floats = SIMD4<Float>(Float(doubles[0]), Float(doubles[1]), Float(doubles[2]), Float(doubles[3]))
@@ -256,9 +259,12 @@ final class MDCTProcessor {
     /// in window-major order so subband layout is `[w0_l0..5, w1_l0..5, w2_l0..5]`.
     /// No alias-reduction butterfly is applied — the decoder skips it for pure short blocks.
     private func processShortGranule(
-        subbandSamples: UnsafePointer<Double>,
-        output: UnsafeMutablePointer<Float>
+        subbandSamples: UnsafeBufferPointer<Double>,
+        output: UnsafeMutableBufferPointer<Float>
     ) {
+        let subbandSamplesBase = subbandSamples.baseAddress!
+        let outputBase = output.baseAddress!
+
         overlapBuffer.withUnsafeMutableBufferPointer { overlap in
             spectralScratch.withUnsafeMutableBufferPointer { spectral in
                 shortInputScratch.withUnsafeMutableBufferPointer { subbandWindowed in
@@ -270,7 +276,7 @@ final class MDCTProcessor {
 
                                 for subband in 0 ..< 32 {
                                     let overlapBase = overlap.baseAddress!.advanced(by: subband * 18)
-                                    let inputBase = subbandSamples.advanced(by: subband * 18)
+                                    let inputBase = subbandSamplesBase.advanced(by: subband * 18)
                                     let flipOdd = (subband & 1) == 1
 
                                     // Build the 36-sample input from previous overlap (first 18) and current
@@ -318,7 +324,7 @@ final class MDCTProcessor {
 
                 // Copy-out to Float, 4 at a time.
                 let sourceRaw = UnsafeRawPointer(spectral.baseAddress!)
-                let destinationRaw = UnsafeMutableRawPointer(output)
+                let destinationRaw = UnsafeMutableRawPointer(outputBase)
                 for offset in stride(from: 0, to: 576, by: 4) {
                     let doubles = sourceRaw.load(fromByteOffset: offset * 8, as: SIMD4<Double>.self)
                     let floats = SIMD4<Float>(Float(doubles[0]), Float(doubles[1]), Float(doubles[2]), Float(doubles[3]))

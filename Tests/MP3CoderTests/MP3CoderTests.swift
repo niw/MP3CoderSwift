@@ -97,7 +97,7 @@ func `huffman count1 decode accepts final short code at end of buffer`() throws 
     let encoded = writer.toData()
 
     try encoded.withUnsafeBytes { rawBuffer in
-        let reader = BitstreamReader(bytes: rawBuffer.bindMemory(to: UInt8.self).baseAddress!, count: encoded.count)
+        let reader = BitstreamReader(bytes: rawBuffer.bindMemory(to: UInt8.self))
         let quad = try huffmanDecodeQuad(reader: reader, tableIndex: 0)
         #expect(quad.first == 0)
         #expect(quad.second == 0)

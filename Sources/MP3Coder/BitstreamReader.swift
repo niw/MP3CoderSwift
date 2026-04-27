@@ -21,22 +21,20 @@ enum BitstreamReaderError: Error {
 /// Storage is non-owning. The caller must keep the underlying buffer alive for the lifetime
 /// of the reader (e.g. by constructing the reader inside a `withUnsafeBufferPointer` block).
 final class BitstreamReader {
-    private let bytesPointer: UnsafePointer<UInt8>
-    private let totalByteCount: Int
+    private let bytes: UnsafeBufferPointer<UInt8>
     private var byteIndex: Int = 0
     private var accumulator: UInt64 = 0
     private var bitsInAccumulator: Int = 0
 
-    init(bytes: UnsafePointer<UInt8>, count: Int, bitPosition: Int = 0) {
-        bytesPointer = bytes
-        totalByteCount = count
+    init(bytes: UnsafeBufferPointer<UInt8>, bitPosition: Int = 0) {
+        self.bytes = bytes
         if bitPosition > 0 {
             try? seek(bitPosition: bitPosition)
         }
     }
 
     var totalBits: Int {
-        totalByteCount * 8
+        bytes.count * 8
     }
 
     var bitPosition: Int {
@@ -51,8 +49,8 @@ final class BitstreamReader {
     /// for the shift to avoid touching bit 64).
     @inline(__always)
     private func refill() {
-        while bitsInAccumulator <= 56, byteIndex < totalByteCount {
-            accumulator |= UInt64(bytesPointer[byteIndex]) << (56 - bitsInAccumulator)
+        while bitsInAccumulator <= 56, byteIndex < bytes.count {
+            accumulator |= UInt64(bytes[byteIndex]) << (56 - bitsInAccumulator)
             bitsInAccumulator += 8
             byteIndex += 1
         }
@@ -127,7 +125,7 @@ final class BitstreamReader {
         bitsInAccumulator = 0
         accumulator = 0
         let byteJump = remainingBits / 8
-        if byteIndex + byteJump > totalByteCount {
+        if byteIndex + byteJump > bytes.count {
             throw BitstreamReaderError.endOfData
         }
         byteIndex += byteJump
