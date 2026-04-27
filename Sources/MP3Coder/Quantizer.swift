@@ -13,11 +13,7 @@ import Foundation
 /// The inner quantize step is vectorized via Accelerate using the identity
 /// `x^0.75 = sqrt(x * sqrt(x))`, which turns a per-element `pow()` into two
 /// `vvsqrtf` calls + one `vDSP_vmul` over 576 values.
-///
-/// `@unchecked Sendable` because all state is owned per-instance and the
-/// encoder's contract is to give each concurrent worker its own quantizer.
-/// Sharing a single instance across tasks would race on the scratch arrays.
-final class Quantizer: @unchecked Sendable {
+final class Quantizer {
     let scaleFactorBandBounds: [Int]
     /// Per bitstream slot, which short window (0..2) owns it. Used by `outerLoopShort`
     /// to compute per-window energy and pre-scale by 2^(2*sg_w).

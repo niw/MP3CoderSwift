@@ -152,21 +152,6 @@ public final class MP3Encoder {
         var nextLongBlockGain: Int
     }
 
-    /// `@unchecked Sendable` shim for buffer pointers handed into the per-channel
-    /// `concurrentPerform` closure. Each parallel worker writes to a disjoint
-    /// slot, so the unchecked conformance is a contract documented at the
-    /// call site (one slot per worker) rather than a global guarantee.
-    private struct ConcurrentPointer<T>: @unchecked Sendable {
-        var base: UnsafeMutableBufferPointer<T>
-    }
-
-    /// Read-only counterpart to `ConcurrentPointer`. The spectral input is
-    /// shared by both workers but never written, so an unchecked Sendable
-    /// shim is enough to hand it across the @Sendable closure boundary.
-    private struct ConcurrentReadonlyPointer<T>: @unchecked Sendable {
-        var base: UnsafeBufferPointer<T>
-    }
-
     private struct PendingMP3Frame {
         var granuleInfos: [[GranuleInfo]]
         var mainData: Data
@@ -527,9 +512,7 @@ public final class MP3Encoder {
 
     /// Quantize one granule's (channel) slots in parallel. Mono falls through
     /// to the inline path; stereo uses `concurrentPerform` over the two
-    /// channels with both per-quantizer scratch and per-(granule, channel)
-    /// destination buffers pre-extracted so the @Sendable closure only
-    /// captures `@unchecked Sendable` raw pointers + value types.
+    /// channels.
     private func quantizeGranule(granule: Int, baseTargetBits: Int, reservoirSlotShare: Int) {
         let psychoModelLocal = psychoModel
         let channelsLocal = channels
@@ -562,34 +545,33 @@ public final class MP3Encoder {
         }
 
         // Stereo — run both channels concurrently. Pre-extract everything the
-        // worker closure needs into local Sendable values (block types, prior
-        // gains, quantizer references, raw pointers) so we never reach back
-        // into `self`-owned mutable storage from inside the @Sendable closure.
+        // worker closure needs into local constants (block types, prior gains,
+        // quantizer references, scratch buffers) so we never reach back into
+        // `self`-owned mutable storage from inside the worker.
         let blockType0 = blockTypesScratch[granule][0]
         let blockType1 = blockTypesScratch[granule][1]
         let priorGain0 = previousLongBlockGain[0]
         let priorGain1 = previousLongBlockGain[1]
-        let quantizer0 = quantizers[0]
-        let quantizer1 = quantizers[1]
+        nonisolated(unsafe) let quantizer0 = quantizers[0]
+        nonisolated(unsafe) let quantizer1 = quantizers[1]
         let granuleLocal = granule
         let baseTargetBitsLocal = baseTargetBits
         let reservoirShareLocal = reservoirSlotShare
 
         granuleSpectralScratch.withUnsafeBufferPointer { spectralSource in
             granuleQuantizedScratch.withUnsafeMutableBufferPointer { quantizedBuffer in
-                let quantizedSlot = ConcurrentPointer(base: quantizedBuffer)
-                let spectralSlot = ConcurrentReadonlyPointer(base: spectralSource)
-
                 let resultsBox = UnsafeMutableBufferPointer<ChannelQuantizationResult>.allocate(capacity: 2)
                 defer { resultsBox.deallocate() }
-                let resultsSlot = ConcurrentPointer(base: resultsBox)
+                nonisolated(unsafe) let quantizedShared = quantizedBuffer
+                nonisolated(unsafe) let spectralShared = spectralSource
+                nonisolated(unsafe) let resultsShared = resultsBox
 
                 DispatchQueue.concurrentPerform(iterations: 2) { channel in
                     let blockType = channel == 0 ? blockType0 : blockType1
                     let priorGain = channel == 0 ? priorGain0 : priorGain1
                     let quantizer = channel == 0 ? quantizer0 : quantizer1
                     let destination = UnsafeMutableBufferPointer(
-                        start: quantizedSlot.base.baseAddress!.advanced(by: (granuleLocal * 2 + channel) * 576),
+                        start: quantizedShared.baseAddress!.advanced(by: (granuleLocal * 2 + channel) * 576),
                         count: 576
                     )
                     let result = Self.quantizeChannelSlot(
@@ -597,7 +579,7 @@ public final class MP3Encoder {
                         channel: channel,
                         channels: 2,
                         blockType: blockType,
-                        spectralBuffer: spectralSlot.base,
+                        spectralBuffer: spectralShared,
                         psychoModel: psychoModelLocal,
                         quantizer: quantizer,
                         baseTargetBits: baseTargetBitsLocal,
@@ -605,7 +587,7 @@ public final class MP3Encoder {
                         previousLongGain: priorGain,
                         destination: destination
                     )
-                    (resultsSlot.base.baseAddress! + channel).initialize(to: result)
+                    (resultsShared.baseAddress! + channel).initialize(to: result)
                 }
 
                 granuleInfosScratch[granule][0] = resultsBox[0].info
@@ -619,7 +601,7 @@ public final class MP3Encoder {
 
     /// Per-(granule, channel) quantization core. Static so the parallel block
     /// can call it without capturing the encoder — every input arrives by
-    /// value or as a `@unchecked Sendable` raw pointer.
+    /// value or as a buffer pointer.
     private static func quantizeChannelSlot(
         granule: Int,
         channel: Int,
