@@ -1,5 +1,5 @@
 //
-//  Psychoacoustic.swift
+//  PsychoacousticModel.swift
 //  MP3Coder
 //
 //  Created by GPT 5.5 and Opus 4.7 on 4/23/26.
