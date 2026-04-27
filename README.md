@@ -23,7 +23,7 @@ let package = Package(
     // ...
     dependencies: [
         // Add Swift Package
-        .package(url: "https://github.com/niw/MP3CoderSwift.git", branch: "master")
+        .package(url: "https://github.com/niw/MP3CoderSwift.git", from: "0.1.0")
     ],
     // ...
     .target(
