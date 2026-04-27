@@ -11,7 +11,7 @@ import MP3Coder
 import Testing
 
 @Test
-func `encode sine wave produces structurally valid MP3`() throws {
+func `Encoder should produce structurally valid MP3 from sine wave`() throws {
     let sampleRate = 44100
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
 
@@ -39,7 +39,7 @@ func `encode sine wave produces structurally valid MP3`() throws {
 }
 
 @Test
-func `encode stereo sine wave produces structurally valid MP3`() throws {
+func `Encoder should produce structurally valid MP3 from stereo sine wave`() throws {
     let sampleRate = 44100
     let channels = 2
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: channels, bitrate: 128)
@@ -69,7 +69,7 @@ func `encode stereo sine wave produces structurally valid MP3`() throws {
 }
 
 @Test
-func `encoder uses bit reservoir when frames have spare main data`() throws {
+func `Encoder should use bit reservoir when frames have spare main data`() throws {
     let sampleRate = 44100
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
 
@@ -88,7 +88,7 @@ func `encoder uses bit reservoir when frames have spare main data`() throws {
 }
 
 @Test
-func `huffman count1 decode accepts final short code at end of buffer`() throws {
+func `Huffman count1 decoder should accept final short code at end of buffer`() throws {
     let (code, bits) = huffmanEncodeQuad(first: 0, second: 0, third: 0, fourth: 0, tableIndex: 0)
     #expect(bits < 10, "Regression setup should exercise padded count1 lookup")
 
@@ -108,7 +108,7 @@ func `huffman count1 decode accepts final short code at end of buffer`() throws 
 }
 
 @Test
-func `round trips encoded sine wave`() throws {
+func `Decoder should round-trip encoded sine wave`() throws {
     let sampleRate = 44100
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
 
@@ -145,7 +145,7 @@ func `round trips encoded sine wave`() throws {
 }
 
 @Test
-func `decodes MP3 fixture against WAV reference`() throws {
+func `Decoder should decode MP3 fixture matching WAV reference`() throws {
     let reference = try loadWAVFixture(named: "sine_440_mono")
     let data = try loadFixture(named: "sine_440_mono", withExtension: "mp3")
     let decoded = try MP3Decoder().decode(data)
@@ -175,7 +175,7 @@ func `decodes MP3 fixture against WAV reference`() throws {
 }
 
 @Test
-func `encodes WAV fixture and decoded output matches reference`() throws {
+func `Encoder should encode WAV fixture so decoded output matches reference`() throws {
     let reference = try loadWAVFixture(named: "sine_440_mono")
     let encoder = try MP3Encoder(sampleRate: reference.sampleRate, channels: reference.channels, bitrate: 128)
 
@@ -211,7 +211,7 @@ func `encodes WAV fixture and decoded output matches reference`() throws {
 }
 
 @Test
-func `decodes music MP3 fixture with expected output shape`() throws {
+func `Decoder should decode music MP3 fixture with expected output shape`() throws {
     let reference = try loadWAVFixture(named: "music")
     let data = try loadFixture(named: "music", withExtension: "mp3")
     let decoded = try MP3Decoder().decode(data)
@@ -228,7 +228,7 @@ func `decodes music MP3 fixture with expected output shape`() throws {
 }
 
 @Test
-func `encodes music WAV fixture segment and decoded output has expected shape`() throws {
+func `Encoder should encode music WAV fixture segment so decoded output has expected shape`() throws {
     let reference = try loadWAVFixture(named: "music")
     let encoder = try MP3Encoder(sampleRate: reference.sampleRate, channels: reference.channels, bitrate: 128)
     let segmentSampleCount = min(reference.samples.count, reference.sampleRate * reference.channels * 2)
@@ -262,21 +262,21 @@ func `encodes music WAV fixture segment and decoded output has expected shape`()
 }
 
 @Test
-func `encode empty input`() throws {
+func `Encoder should produce no output for empty input`() throws {
     let encoder = try MP3Encoder(sampleRate: 44100, channels: 1, bitrate: 128)
     let output = encoder.encode(pcm: [])
     #expect(output.count == 0, "Empty input should produce no output")
 }
 
 @Test
-func `unsupported sample rate`() {
+func `Encoder should reject unsupported sample rate`() {
     #expect(throws: MP3EncoderError.unsupportedSampleRate(22050)) {
         try MP3Encoder(sampleRate: 22050, channels: 1, bitrate: 128)
     }
 }
 
 @Test
-func `tonality tightens threshold vs noise at equal energy`() {
+func `Psychoacoustic model should tighten threshold for tonal vs noise at equal energy`() {
     // Build two spectral arrays with the same total energy in the same band:
     // one with all of it in a single bin (pure tone), one spread evenly
     // (white noise). The tonal version should produce a noticeably tighter
@@ -317,7 +317,7 @@ func `tonality tightens threshold vs noise at equal energy`() {
 }
 
 @Test
-func `correlated stereo selects mid-side coding`() throws {
+func `Encoder should select mid-side coding for correlated stereo`() throws {
     let sampleRate = 44100
     let channels = 2
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: channels, bitrate: 128)
@@ -351,7 +351,7 @@ func `correlated stereo selects mid-side coding`() throws {
 }
 
 @Test
-func `uncorrelated stereo stays in L slash R`() throws {
+func `Encoder should stay in L slash R for uncorrelated stereo`() throws {
     let sampleRate = 44100
     let channels = 2
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: channels, bitrate: 128)
@@ -381,7 +381,7 @@ func `uncorrelated stereo stays in L slash R`() throws {
 }
 
 @Test
-func `mid-side stereo round trips`() throws {
+func `Encoder should round-trip mid-side stereo`() throws {
     let sampleRate = 44100
     let channels = 2
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: channels, bitrate: 128)
@@ -430,7 +430,7 @@ func `mid-side stereo round trips`() throws {
 }
 
 @Test
-func `transient triggers short block switching`() throws {
+func `Encoder should switch to short blocks for transient`() throws {
     let sampleRate = 44100
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
 
@@ -477,7 +477,7 @@ func `transient triggers short block switching`() throws {
 }
 
 @Test
-func `single-window impulse exercises subblock_gain`() throws {
+func `Encoder should set subblock_gain for single-window impulse`() throws {
     let sampleRate = 44100
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
 
