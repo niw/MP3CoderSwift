@@ -342,6 +342,58 @@ func `Encoder should round-trip mid-side stereo`() throws {
 }
 
 @Test
+func `Encoder lookahead should catch a step transient before it lands in a long block`() throws {
+    // Sustained low-amplitude tone for ~3 s, then a sharp step up to a much
+    // louder tone — no silence around the seam. This is the case the old
+    // `transientPreview` would miss: each granule of the post-step tone has a
+    // low intra-granule ratio (steady inside the granule), no `intraOnsetSpike`
+    // (no sub-window dropping to silence), and the only signal that the
+    // transient is coming is the *interRatio* against the previous granule.
+    // With the lookahead now mirroring the in-line detector, the granule
+    // *before* the step should switch to `.start`, the step granule itself
+    // should be `.shortBlocks`, and the profiler's `lateTransients` counter
+    // should report zero. The old code would fail both: it would emit
+    // `.start` *at* the step granule and bump `lateTransients`.
+    let sampleRate = 44100
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
+    let profiler = MP3EncoderProfiler()
+    encoder.profiler = profiler
+
+    let preStepSamples = sampleRate * 3
+    let postStepSamples = sampleRate / 2
+    var pcm = [Float](repeating: 0, count: preStepSamples + postStepSamples)
+    let lowAmplitude: Float = 0.1
+    let highAmplitude: Float = 0.5
+    for sampleIndex in 0 ..< preStepSamples {
+        let phase = 2.0 * Double.pi * 440.0 * Double(sampleIndex) / Double(sampleRate)
+        pcm[sampleIndex] = Float(sin(phase)) * lowAmplitude
+    }
+    for sampleIndex in 0 ..< postStepSamples {
+        let phase = 2.0 * Double.pi * 440.0 * Double(preStepSamples + sampleIndex) / Double(sampleRate)
+        pcm[preStepSamples + sampleIndex] = Float(sin(phase)) * highAmplitude
+    }
+
+    var encoded = encoder.encode(pcm: pcm)
+    encoded.append(encoder.flush())
+
+    let frames = try parseMP3Frames(encoded)
+    let stats = try collectBlockTypeStats(frames: frames, data: encoded)
+
+    #expect(
+        stats.shortBlockGranules > 0,
+        "Step transient should still drive at least one short-block granule"
+    )
+    #expect(
+        stats.startBlockGranules > 0,
+        "Step transient should be preceded by a start block"
+    )
+    #expect(
+        profiler.value(for: .lateTransients) == 0,
+        "Lookahead should catch the step transient before it becomes 'late' (got \(profiler.value(for: .lateTransients)))"
+    )
+}
+
+@Test
 func `Encoder should switch to short blocks for transient`() throws {
     let sampleRate = 44100
     let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)

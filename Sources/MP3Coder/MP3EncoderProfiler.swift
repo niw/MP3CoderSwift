@@ -61,6 +61,14 @@ public final class MP3EncoderProfiler {
         case outerLoopReservoirPasses
         /// Number of short-block fast-path calls (`outerLoopShort`).
         case outerLoopShortPasses
+        /// Number of "late" transient detections: a granule with previous block
+        /// `.long`/`.stop` that fired the in-line transient detector when the
+        /// preceding granule's lookahead did *not* — i.e. the lookahead missed
+        /// and we emit `.start` at the transient granule itself instead of the
+        /// granule before. Each occurrence is a candidate for visible pre-echo,
+        /// since the transient lands inside the start window's long-resolution
+        /// region. Healthy encodes report 0.
+        case lateTransients
 
         var displayName: String {
             switch self {
@@ -80,6 +88,8 @@ public final class MP3EncoderProfiler {
                 "outerLoopReservoirPasses"
             case .outerLoopShortPasses:
                 "outerLoopShortPasses"
+            case .lateTransients:
+                "lateTransients"
             }
         }
     }
@@ -207,6 +217,7 @@ public final class MP3EncoderProfiler {
             let distIters = value(for: .distortionIterations)
             let reservoirPasses = value(for: .outerLoopReservoirPasses)
             let shortPasses = value(for: .outerLoopShortPasses)
+            let lateTransients = value(for: .lateTransients)
             let probesPerCall = innerCalls > 0
                 ? Double(innerProbes) / Double(innerCalls)
                 : 0
@@ -220,6 +231,7 @@ public final class MP3EncoderProfiler {
             lines.append(String(format: "    distortion passes: %d (%.2f iters / pass)", distPasses, itersPerPass))
             lines.append(String(format: "    outerLoop reservoir passes: %d", reservoirPasses))
             lines.append(String(format: "    outerLoop short-block passes: %d", shortPasses))
+            lines.append(String(format: "    late transient detections: %d", lateTransients))
         }
 
         return lines.joined(separator: "\n")

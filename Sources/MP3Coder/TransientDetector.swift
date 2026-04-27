@@ -17,7 +17,13 @@ import Foundation
 final class TransientDetector {
     private var previousEnergy: Double = 0
     /// Linear ratio threshold (~+10 dB) tuned for music: low enough to catch drum
-    /// onsets, high enough to ignore steady-state harmonic content.
+    /// onsets, high enough to ignore steady-state harmonic content. Used by both
+    /// the in-line detector and the lookahead variant — the lookahead must fire
+    /// in exactly the same situations the in-line detector would fire one granule
+    /// later, otherwise transients sneak past the lookahead and land in the
+    /// long-resolution part of a `.start` window (pre-echo). Going *below* the
+    /// in-line threshold over-triggers on natural per-granule energy modulation
+    /// (vibrato, AM, dynamic music) and produces audible scattering artifacts.
     private let ratioThreshold: Double = 10.0
     /// Floor below which energies are treated as silence (avoids divide-by-zero
     /// blowing the ratio up on near-silent input).
@@ -66,5 +72,58 @@ final class TransientDetector {
 
         previousEnergy = maxEnergy
         return isTransient
+    }
+
+    /// Lookahead variant: peek one granule ahead without mutating detector state.
+    ///
+    /// Used by `MP3Encoder` to decide the *current* granule's block type when a
+    /// transient lives in the *next* granule. Mirrors `detectTransient`'s
+    /// criteria exactly — same three-sub-window energy analysis, same
+    /// `intraOnsetSpike`/`intraRatio`/`interRatio` checks, same `ratioThreshold`
+    /// — but reads `previousEnergy` instead of writing it. The point is
+    /// symmetry: the lookahead must flag every granule the in-line detector
+    /// would flag one call later. Anything weaker lets transients sneak past
+    /// (→ pre-echo); anything stronger over-triggers on natural music dynamics
+    /// (→ scattering artefacts from spurious short-block sequences).
+    ///
+    /// Accepts a strided view so the encoder can run this directly over
+    /// interleaved input PCM without a deinterleave copy. `sampleCount` is the
+    /// granule length in (post-stride) samples; the caller's buffer may extend
+    /// further but only the first `sampleCount * stride` slots are read.
+    func detectTransientLookahead(
+        pcm: UnsafeBufferPointer<Float>,
+        sampleCount: Int,
+        stride sampleStride: Int = 1
+    ) -> Bool {
+        let subWindowCount = 3
+        let subWindowSize = sampleCount / subWindowCount
+        guard subWindowSize > 0 else {
+            return false
+        }
+
+        var maxEnergy = 0.0
+        var minEnergy = Double.greatestFiniteMagnitude
+        for windowIndex in 0 ..< subWindowCount {
+            var energy = 0.0
+            let windowStart = windowIndex * subWindowSize * sampleStride
+            for sampleIndex in 0 ..< subWindowSize {
+                let sample = Double(pcm[windowStart + sampleIndex * sampleStride])
+                energy += sample * sample
+            }
+            energy /= Double(subWindowSize)
+            if energy > maxEnergy {
+                maxEnergy = energy
+            }
+            if energy < minEnergy {
+                minEnergy = energy
+            }
+        }
+
+        let intraOnsetSpike = minEnergy <= energyFloor && maxEnergy > energyFloor
+        let intraRatio = minEnergy > energyFloor ? maxEnergy / minEnergy : 0.0
+        let interRatio = previousEnergy > energyFloor ? maxEnergy / previousEnergy : 0.0
+        return intraOnsetSpike
+            || intraRatio > ratioThreshold
+            || interRatio > ratioThreshold
     }
 }

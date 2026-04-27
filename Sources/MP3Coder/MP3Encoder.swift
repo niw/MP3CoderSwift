@@ -364,15 +364,18 @@ public final class MP3Encoder {
                 // Peek (don't consume) one more granule to drive granule-1's lookahead.
                 inputBuffer.withUnsafeBufferPointer { inputRegion in
                     let lookaheadStart = sampleBase + samplesPerFrameCount * channels
+                    let granuleSamples = samplesPerGranule
                     if channels == 1 {
-                        nextFrameTransientScratch[0] = transientPreview(
+                        nextFrameTransientScratch[0] = transientDetectors[0].detectTransientLookahead(
                             pcm: UnsafeBufferPointer(rebasing: inputRegion[lookaheadStart...]),
+                            sampleCount: granuleSamples,
                             stride: 1
                         )
                     } else {
                         for channel in 0 ..< channels {
-                            nextFrameTransientScratch[channel] = transientPreview(
+                            nextFrameTransientScratch[channel] = transientDetectors[channel].detectTransientLookahead(
                                 pcm: UnsafeBufferPointer(rebasing: inputRegion[(lookaheadStart + channel)...]),
+                                sampleCount: granuleSamples,
                                 stride: 2
                             )
                         }
@@ -779,6 +782,13 @@ public final class MP3Encoder {
             // window first; the transient itself is then captured by the short
             // block in the following granule.
             if currentTransient || nextTransient {
+                // If only `currentTransient` fired, the transient is in *this*
+                // granule and the lookahead missed it: the start window's
+                // long-resolution first half will then carry the transient and
+                // produce pre-echo. Track the case so regressions are visible.
+                if currentTransient, !nextTransient {
+                    profiler?.incrementCounter(.lateTransients)
+                }
                 return .start
             }
             return .long
@@ -795,44 +805,6 @@ public final class MP3Encoder {
             }
             return .stop
         }
-    }
-
-    /// Lightweight transient check used for the granule of lookahead past the end
-    /// of the current frame. We don't update detector state here so the per-channel
-    /// energy history stays aligned with the granules we actually encode.
-    private func transientPreview(
-        pcm: UnsafeBufferPointer<Float>,
-        stride sampleStride: Int
-    ) -> Bool {
-        // Strided sum-of-squares directly on the interleaved input — no de-interleave
-        // copy. The detector is a heuristic so single-precision accumulation is fine.
-        let granuleSamples = samplesPerGranule
-        let subWindowSize = granuleSamples / 3
-        guard subWindowSize > 0 else {
-            return false
-        }
-        let length = vDSP_Length(subWindowSize)
-        let stride = vDSP_Stride(sampleStride)
-        let inverseLength = 1.0 / Double(subWindowSize)
-        let pcmBase = pcm.baseAddress!
-
-        var maxEnergy = 0.0
-        var minEnergy = Double.greatestFiniteMagnitude
-        for windowIndex in 0 ..< 3 {
-            let start = windowIndex * subWindowSize * sampleStride
-            var sumOfSquares: Float = 0
-            vDSP_svesq(pcmBase.advanced(by: start), stride, &sumOfSquares, length)
-            let energy = Double(sumOfSquares) * inverseLength
-            if energy > maxEnergy {
-                maxEnergy = energy
-            }
-            if energy < minEnergy {
-                minEnergy = energy
-            }
-        }
-        let intraRatio = minEnergy > 1e-9 ? maxEnergy / minEnergy : 0.0
-        let intraOnsetSpike = minEnergy <= 1e-9 && maxEnergy > 1e-9
-        return intraOnsetSpike || intraRatio > 10.0
     }
 
     // MARK: - Bitstream writing
