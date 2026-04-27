@@ -219,7 +219,34 @@ public final class MP3Encoder {
     /// Encode PCM samples (interleaved if stereo)
     /// Returns encoded MP3 data (may be empty if not enough samples yet)
     public func encode(pcm: [Float]) -> Data {
+        guard pcm.count > 0 else {
+            return drainFrames()
+        }
+
         inputBuffer.append(contentsOf: pcm)
+        return drainFrames()
+    }
+
+    /// Encode 16-bit signed integer PCM samples (interleaved if stereo).
+    /// `Int16.min` maps to `-1.0`, `Int16.max` to ~`0.99997` (Q15 convention).
+    public func encode(pcm: [Int16]) -> Data {
+        let count = pcm.count
+        guard count > 0 else {
+            return drainFrames()
+        }
+
+        let writeStart = inputBuffer.count
+        inputBuffer.append(contentsOf: repeatElement(0, count: count))
+
+        pcm.withUnsafeBufferPointer { source in
+            inputBuffer.withUnsafeMutableBufferPointer { destination in
+                let writePointer = destination.baseAddress!.advanced(by: writeStart)
+                vDSP_vflt16(source.baseAddress!, 1, writePointer, 1, vDSP_Length(count))
+                var scale: Float = 1.0 / 32768.0
+                vDSP_vsmul(writePointer, 1, &scale, writePointer, 1, vDSP_Length(count))
+            }
+        }
+
         return drainFrames()
     }
 

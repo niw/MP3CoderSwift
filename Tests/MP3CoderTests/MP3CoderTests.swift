@@ -39,6 +39,63 @@ func `Encoder should produce structurally valid MP3 from sine wave`() throws {
 }
 
 @Test
+func `Encoder should produce structurally valid MP3 from Int16 sine wave`() throws {
+    let sampleRate = 44100
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
+
+    let sampleCount = sampleRate
+    var pcmSamples = [Int16](repeating: 0, count: sampleCount)
+    for sampleIndex in 0 ..< sampleCount {
+        let value = sin(2.0 * Double.pi * 440.0 * Double(sampleIndex) / Double(sampleRate)) * 0.5
+        pcmSamples[sampleIndex] = Int16(value * 32768.0)
+    }
+
+    var output = encoder.encode(pcm: pcmSamples)
+    output.append(encoder.flush())
+
+    #expect(output.count > 0, "Encoded output should be non-empty")
+
+    let frames = try parseMP3Frames(output)
+    #expect(!frames.isEmpty, "Bitstream should contain at least one parsed frame")
+    for frame in frames {
+        #expect(frame.version == .mpeg1)
+        #expect(frame.layer == .layer3)
+        #expect(frame.sampleRate == sampleRate)
+        #expect(frame.bitrate == 128)
+        #expect(frame.channelMode == .mono)
+    }
+    try assertMainDataReservoirIsConsistent(frames: frames)
+}
+
+@Test
+func `Encoder should round-trip Int16 sine wave to the dominant frequency`() throws {
+    let sampleRate = 44100
+    let encoder = try MP3Encoder(sampleRate: sampleRate, channels: 1, bitrate: 128)
+
+    let sampleCount = sampleRate
+    var pcmSamples = [Int16](repeating: 0, count: sampleCount)
+    for sampleIndex in 0 ..< sampleCount {
+        let value = sin(2.0 * Double.pi * 440.0 * Double(sampleIndex) / Double(sampleRate)) * 0.5
+        pcmSamples[sampleIndex] = Int16(value * 32768.0)
+    }
+
+    var encoded = encoder.encode(pcm: pcmSamples)
+    encoded.append(encoder.flush())
+
+    let decoded = try MP3Decoder().decode(encoded)
+    #expect(decoded.sampleRate == sampleRate)
+    #expect(decoded.channels == 1)
+
+    let dominant = dominantFrequency(
+        samples: decoded.samples,
+        sampleRate: Double(decoded.sampleRate),
+        start: min(2048, decoded.samples.count / 4),
+        maxFrequency: 1000
+    )
+    #expect(abs(dominant - 440.0) < 30.0, "Dominant frequency should be ~440 Hz, got \(dominant)")
+}
+
+@Test
 func `Encoder should produce structurally valid MP3 from stereo sine wave`() throws {
     let sampleRate = 44100
     let channels = 2
@@ -264,7 +321,7 @@ func `Encoder should encode music WAV fixture segment so decoded output has expe
 @Test
 func `Encoder should produce no output for empty input`() throws {
     let encoder = try MP3Encoder(sampleRate: 44100, channels: 1, bitrate: 128)
-    let output = encoder.encode(pcm: [])
+    let output = encoder.encode(pcm: [] as [Float])
     #expect(output.count == 0, "Empty input should produce no output")
 }
 
